@@ -365,6 +365,7 @@ pub fn main(cli: Cli) {
                     let col_float = col.cast(&DataType::Float64).unwrap().drop_nulls();
                     let col_mean = col_float.mean().unwrap_or(0.0);
                     let col_std = col_float.std(1).unwrap_or(0.0);
+                    let col_std = if col_std == 0.0 { 1.0 } else { col_std };
                     table.col_stats.push(ColStat {
                         mean: col_mean,
                         std: col_std,
