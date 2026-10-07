@@ -74,13 +74,20 @@ class MaskedAttention(nn.Module):
 
         v = v.to(q.dtype)
 
-        attn_out = flex_attention(
-            q,
-            k,
-            v,
-            block_mask=block_mask,
-            scale=1.0 / self.head_dim,
-        )
+        if isinstance(block_mask, torch.Tensor):
+            # FlexAttention cannot backpropagate on CPU. The dense mask route
+            # uses exactly the same attention equation for short CPU contexts.
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=block_mask[:, None], scale=1.0 / self.head_dim
+            )
+        else:
+            attn_out = flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=1.0 / self.head_dim,
+            )
         attn_out = rearrange(attn_out, "b h s d -> b s (h d)")
 
         gate = 2 * torch.sigmoid(self.wg(x))
@@ -388,7 +395,7 @@ class RelationalTransformer(nn.Module):
             k = t + "_values"
             type_values[t] = batch[k].gather(1, si.expand_as(batch[k]))
 
-        if self.materialize_attn_masks:
+        if self.materialize_attn_masks or device.type == "cpu":
             # Materialize (B, S, S) pairwise masks, then convert to block masks.
             pad = (~is_padding[:, :, None]) & (~is_padding[:, None, :])
             same_node = node_idxs[:, :, None] == node_idxs[:, None, :]
@@ -414,17 +421,20 @@ class RelationalTransformer(nn.Module):
             for attn_type in attn_masks:
                 attn_masks[attn_type] = attn_masks[attn_type].contiguous()
 
-            make_block_mask = partial(
-                _make_block_mask,
-                batch_size=batch_size,
-                q_seq_len=seq_len,
-                kv_seq_len=seq_len,
-                device=device,
-            )
-            block_masks = {
-                attn_type: make_block_mask(attn_mask)
-                for attn_type, attn_mask in attn_masks.items()
-            }
+            if device.type == "cpu":
+                block_masks = attn_masks
+            else:
+                make_block_mask = partial(
+                    _make_block_mask,
+                    batch_size=batch_size,
+                    q_seq_len=seq_len,
+                    kv_seq_len=seq_len,
+                    device=device,
+                )
+                block_masks = {
+                    attn_type: make_block_mask(attn_mask)
+                    for attn_type, attn_mask in attn_masks.items()
+                }
         else:
             # Build sparse block masks via flex_attention's mask_mod path: closures index
             # into per-token tensors directly. create_block_mask samples mask_mod at block

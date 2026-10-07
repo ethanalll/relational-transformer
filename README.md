@@ -21,6 +21,10 @@ GitHub. It builds the extension from source, so you need a
 pip install "git+https://github.com/stanford-star/relational-transformer.git"
 ```
 
+Small CPU inference and training runs use PyTorch's dense scaled dot-product
+attention with the same relational masks. CUDA retains FlexAttention. CPU
+contexts require quadratic mask memory, so keep their context sizes small.
+
 ## Quickstart
 
 The quickest way to try a released checkpoint is on a RelBench
