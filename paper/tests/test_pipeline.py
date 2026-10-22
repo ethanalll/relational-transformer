@@ -230,3 +230,99 @@ def test_interrupted_resume_matches_uninterrupted(raw_database, tmp_path, monkey
     assert all(torch.equal(v, b[k]) for k, v in a.items())
     report = run(dict(interrupted, resume=str(tmp_path / "interrupted/resume.pt")))
     assert report["steps"] == 6
+
+
+def test_fixed_validation_subset_covers_databases_and_types():
+    import random
+    from rt.tasks import TaskSpec, select_validation_tasks
+
+    tasks = [
+        TaskSpec(db, "table", f"{kind}-{i}", kind)
+        for db in ["db-b", "db-a"]
+        for kind in ["clf", "reg"]
+        for i in range(4)
+    ]
+    tasks.append(TaskSpec("db-small", "table", "only", "reg"))
+    before = random.getstate()
+    selected = select_validation_tasks(tasks, tasks_per_db=2, seed=7)
+    assert random.getstate() == before  # Selection does not perturb training RNG.
+    assert selected == select_validation_tasks(list(reversed(tasks)), 2, seed=7)
+    assert len(selected) == 5
+    for db in ["db-a", "db-b"]:
+        assert {t.task_type for t in selected if t.db_name == db} == {"clf", "reg"}
+    assert len([t for t in selected if t.db_name == "db-small"]) == 1
+    assert len(select_validation_tasks(tasks)) == len(tasks)  # Broader final eval.
+    assert len(select_validation_tasks(tasks, 1)) == 3
+    with pytest.raises(ValueError, match="eval_tasks_per_db"):
+        select_validation_tasks(tasks, 0)
+
+
+def test_capped_validation_fixed_examples_and_independent_checkpoints(
+    raw_database, tmp_path, monkeypatch
+):
+    import rt.main as training
+
+    _, _, pre = prepare(raw_database, tmp_path, "train", 0)
+    _, _, val = prepare(raw_database, tmp_path, "val", 1)
+    cfg = dict(
+        train_pre_dir=str(pre), val_pre_dir=str(val),
+        output_dir=str(tmp_path / "straight"), initialization="scratch",
+        diagnostic=True, backend="portable",
+        model=dict(num_blocks=1, d_model=16, d_text=384, num_heads=4, d_ff=32),
+        batch_size=2, ctx_len=32, bfs_width=8, lr=1e-4, steps=6,
+        device="cpu", seed=2, eval_seed=0, eval_tasks_per_db=2,
+        eval_batch_size=3, eval_every=3, eval_batches=1, checkpoint_every=2,
+    )
+    batches = []
+    original_forward = RelationalTransformer.forward
+
+    def recording_forward(model, batch):
+        if not model.training:
+            batches.append({key: value.clone() for key, value in batch.items()})
+        return original_forward(model, batch)
+
+    monkeypatch.setattr(RelationalTransformer, "forward", recording_forward)
+    saved_steps = []
+    original_save = training.save_checkpoint
+
+    def recording_save(*args, **kwargs):
+        original_save(*args, **kwargs)
+        saved_steps.append(kwargs["steps"])
+
+    monkeypatch.setattr(training, "save_checkpoint", recording_save)
+    run(cfg)
+    assert saved_steps == [2, 4, 6]  # Evaluation instead occurs at 0,3,6.
+    history = json.loads((tmp_path / "straight/history.json").read_text())
+    rounds = [entry for entry in history if "validation" in entry]
+    assert [entry["step"] for entry in rounds] == [0, 3, 6]
+    assert all(entry["validation"]["task_count"] == 2 for entry in rounds)
+    assert all(entry["validation"]["batches"] == 2 for entry in rounds)
+    assert len(batches) == 6
+    assert all(len(batch["is_targets"]) == 3 for batch in batches)
+    for task_index in range(2):
+        for round_index in [1, 2]:
+            for key in batches[task_index]:
+                assert torch.equal(
+                    batches[task_index][key], batches[2 * round_index + task_index][key]
+                )
+    selection = json.loads((tmp_path / "straight/validation_tasks.json").read_text())
+    assert len(selection["tasks"]) == 2
+    assert {t["task_type"] for t in selection["tasks"]} == {"clf", "reg"}
+
+    interrupted = dict(cfg, output_dir=str(tmp_path / "interrupted"))
+
+    def interrupt_after_first_checkpoint(*args, **kwargs):
+        original_save(*args, **kwargs)
+        if kwargs["steps"] == 2:
+            raise RuntimeError("simulated preemption between evaluations")
+
+    monkeypatch.setattr(training, "save_checkpoint", interrupt_after_first_checkpoint)
+    with pytest.raises(RuntimeError, match="simulated preemption"):
+        run(interrupted)
+    monkeypatch.setattr(training, "save_checkpoint", recording_save)
+    run(dict(interrupted, resume=str(tmp_path / "interrupted/resume.pt")))
+    history = json.loads((tmp_path / "interrupted/history.json").read_text())
+    assert [e["step"] for e in history if "validation" in e] == [0, 3, 6]
+    straight = torch.load(tmp_path / "straight/model.pt", weights_only=True)
+    resumed = torch.load(tmp_path / "interrupted/model.pt", weights_only=True)
+    assert all(torch.equal(value, resumed[key]) for key, value in straight.items())

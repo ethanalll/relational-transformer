@@ -95,8 +95,23 @@ validates on the configured corpus; also cross-evaluate both models on the SAME
 old/new held-out corpora before comparing losses. There is no automatic real
 RelBench task-table import in this first synthetic-corpus runner.
 
+Pilot validation samples two eligible target columns per validation database,
+including both numerical and Boolean tasks where available. With 32 databases
+this is at most 64 tasks. Selection uses `eval_seed: 0` independently of the
+training seed; sampler seed/epoch are fixed so each round uses the same examples.
+The selected identities are recorded in `validation_tasks.json`. Use the same
+held-out corpus and evaluation settings when comparing trained models.
+
+`first_continuation.json` evaluates one batch of 128 examples per selected task
+at steps 0, 256, 512, 768 and 1024: at most 320 evaluation batches. Small tables
+may provide partial batches. `checkpoint_every: 128` saves independently of
+`eval_every: 256`. Validation logs its actual task count, batch count and elapsed
+time. Resuming does not add an extra validation round. To evaluate all columns,
+set `eval_tasks_per_db` to null/omit it; `scripts/evaluate.py` still evaluates all
+eligible tasks by default for broader final cross-evaluation.
+
 Outputs: `model.pt` (canonical weights), `resume.pt` (optimizer/scheduler and
-sampler position), `config.json`, `history.json`, `report.json`. To resume, pass
+sampler position), `config.json`, `validation_tasks.json`, `history.json`, `report.json`. To resume, pass
 `--resume /data/runs/ARM/resume.pt` with the same config, paths and output dir.
 The same seed and sampler epoch/batch position are restored. Resume config and
 corpus fingerprints must match. No automatic best-checkpoint or test-set tuning.

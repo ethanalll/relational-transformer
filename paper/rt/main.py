@@ -1,6 +1,7 @@
 """Single-GPU paper-model continuation with explicit corpora and strict weights."""
 
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 import random
@@ -14,7 +15,7 @@ from .checkpoints import load_paper_checkpoint, save_checkpoint
 from .corpus import digest
 from .data import RelationalDataset
 from .model import RelationalTransformer
-from .tasks import load_tasks
+from .tasks import load_tasks, select_validation_tasks
 
 PAPER_DIMS = dict(num_blocks=12, d_model=256, d_text=384, num_heads=8, d_ff=1024)
 
@@ -47,16 +48,22 @@ def move_batch(batch, device, dtype):
 
 @torch.inference_mode()
 def evaluate(model, pre_dir, config, *, diagnostic=False):
+    start = time.monotonic()
+    was_training = model.training
     model.eval()
     results = {}
-    for task in load_tasks(pre_dir):
+    total_batches = 0
+    tasks = select_validation_tasks(
+        load_tasks(pre_dir), config.get("eval_tasks_per_db"), config.get("eval_seed", 0)
+    )
+    for task in tasks:
         data = RelationalDataset(
             [task],
             pre_dir,
-            batch_size=config["batch_size"],
+            batch_size=config.get("eval_batch_size", config["batch_size"]),
             ctx_len=config["ctx_len"],
             max_bfs_width=config["bfs_width"],
-            seed=0,
+            seed=config.get("eval_seed", 0),
             backend=config["backend"],
         )
         losses, preds, labels = [], [], []
@@ -65,6 +72,7 @@ def evaluate(model, pre_dir, config, *, diagnostic=False):
                 data[index], next(model.parameters()).device, next(model.parameters()).dtype
             )
             loss, prediction = model(batch)
+            total_batches += 1
             if not torch.isfinite(loss):
                 raise ValueError("Nonfinite evaluation loss")
             key = "boolean" if task.task_type == "clf" else "number"
@@ -91,8 +99,14 @@ def evaluate(model, pre_dir, config, *, diagnostic=False):
             count=len(labels),
             undefined_reason=reason,
         )
-    model.train()
-    return dict(tasks=results, mean_loss=float(np.mean([r["loss"] for r in results.values()])))
+    model.train(was_training)
+    return dict(
+        tasks=results,
+        task_count=len(results),
+        batches=total_batches,
+        seconds=time.monotonic() - start,
+        mean_loss=float(np.mean([r["loss"] for r in results.values()])),
+    )
 
 
 def validate_run_config(config):
@@ -119,6 +133,18 @@ def validate_run_config(config):
         raise ValueError("Need >=6 steps and positive batch/context/width")
     if config.get("initialization", "pretrained") == "pretrained" and not config.get("checkpoint"):
         raise ValueError("Pretrained continuation requires an explicit checkpoint")
+    for key, default in [
+        ("eval_every", 128),
+        ("checkpoint_every", config.get("eval_every", 128)),
+        ("eval_batches", 2),
+        ("eval_batch_size", config["batch_size"]),
+    ]:
+        value = config.get(key, default)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    cap = config.get("eval_tasks_per_db")
+    if cap is not None and (type(cap) is not int or cap < 1):
+        raise ValueError("eval_tasks_per_db must be a positive integer or null")
     if not config.get("diagnostic", False):
         if config["backend"] != "native":
             raise ValueError("Experiments require the paper native sampler")
@@ -200,6 +226,12 @@ def run(config):
             "backend",
             "seed",
             "model",
+            "eval_tasks_per_db",
+            "eval_seed",
+            "eval_batch_size",
+            "eval_batches",
+            "eval_every",
+            "checkpoint_every",
         ]:
             if previous.get(key) != config.get(key):
                 raise ValueError(f"Resume changed {key}")
@@ -224,20 +256,36 @@ def run(config):
         for key in ["train_pre_dir", "val_pre_dir"]
         if config.get(key)
     }
+    validation = config.get("val_pre_dir")
+    if validation:
+        selected = select_validation_tasks(
+            load_tasks(validation), config.get("eval_tasks_per_db"), config.get("eval_seed", 0)
+        )
+        (out / "validation_tasks.json").write_text(json.dumps(dict(
+            seed=config.get("eval_seed", 0),
+            tasks_per_db=config.get("eval_tasks_per_db"),
+            batch_size=config.get("eval_batch_size", config["batch_size"]),
+            batches_per_task=config.get("eval_batches", 2),
+            tasks=[asdict(task) for task in selected],
+        ), indent=2) + "\n")
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     history = (
         json.loads((out / "history.json").read_text())
         if resume_path and (out / "history.json").exists()
         else []
     )
+    if resume_path:
+        history = [entry for entry in history if entry["step"] <= steps]
     if steps >= config["steps"]:
         if (out / "report.json").exists():
             return json.loads((out / "report.json").read_text())
         raise ValueError("Resume is already complete but final report is missing")
-    validation = config.get("val_pre_dir")
-    if validation:
+    if validation and not resume_path:
         initial = evaluate(model, validation, config)
         history.append(dict(step=steps, validation=initial))
+        (out / "history.json").write_text(json.dumps(history, indent=2, allow_nan=False) + "\n")
+        print(f"Validation step {steps}: {initial['task_count']} tasks, "
+              f"{initial['batches']} batches, {initial['seconds']:.1f}s", flush=True)
     model.train()
     start = time.monotonic()
     for step in range(steps, config["steps"]):
@@ -268,9 +316,21 @@ def run(config):
             lr=scheduler.get_last_lr()[0],
         )
         history.append(entry)
-        if (step + 1) % config.get("eval_every", 128) == 0 or step + 1 == config["steps"]:
-            if validation:
-                entry["validation"] = evaluate(model, validation, config)
+        final_step = step + 1 == config["steps"]
+        eval_due = bool(validation) and (
+            (step + 1) % config.get("eval_every", 128) == 0 or final_step
+        )
+        checkpoint_due = (
+            (step + 1) % config.get("checkpoint_every", config.get("eval_every", 128)) == 0
+            or final_step
+        )
+        if eval_due:
+            result = entry["validation"] = evaluate(model, validation, config)
+            print(f"Validation step {step + 1}: {result['task_count']} tasks, "
+                  f"{result['batches']} batches, {result['seconds']:.1f}s", flush=True)
+        if eval_due or checkpoint_due:
+            (out / "history.json").write_text(json.dumps(history, indent=2, allow_nan=False) + "\n")
+        if checkpoint_due:
             save_checkpoint(
                 out / "resume.pt",
                 model,
@@ -284,7 +344,6 @@ def run(config):
                 targets=targets,
                 slots=slots,
             )
-            (out / "history.json").write_text(json.dumps(history, indent=2, allow_nan=False) + "\n")
     final = getattr(model, "_orig_mod", model)
     torch.save(final.state_dict(), out / "model.pt")
     report = dict(
