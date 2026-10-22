@@ -1,0 +1,2 @@
+# Keep the archived sources byte-for-byte, including their original whitespace.
+reference/** -whitespace

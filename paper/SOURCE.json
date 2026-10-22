@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/stanford-star/plurel",
+  "revision": "2a273cfd21933ee4893dfcb862a3edaed45ac665",
+  "tag": "v1.0.0",
+  "reference_sha256": {
+    "rt/model.py": "f535b04fb5aaf0c6db104aeb8edd0252b114c12dffd0012a2bd856f05648ef18",
+    "rt/data.py": "f668e48a7d452b3a9f1d7badfa5f8dd59a0681f8f060255bada259a82241a1a5",
+    "rt/embed.py": "8bbbfb982cfc0c9b2efc8d96183700aebe2c0c3f8c8659a1882455bdf7e7071b",
+    "rt/main.py": "ea9cbf89e40288986284ddebe377bd13d629307c312512a93c2bdfa093e673a0",
+    "rt/tasks.py": "a0c0f3d3b349cb26e3a2af987cb66f9bd58952132eaddccadbe8b1da339f4944",
+    "rt/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rustler/src/pre.rs": "3545c1fc89afe709a40c55dc350dde9f4fe294183a56b81a6451a831fa399bab",
+    "rustler/src/fly.rs": "8ea4161e07785bf4c51808644e877e8e924dd6ca18354d059b55c4c7eff5ae71",
+    "rustler/src/common.rs": "a77133a50ea3ee27b185ad0317b9e94289b6a4898ff745594695804634ea070c",
+    "rustler/src/lib.rs": "6b511ee5a4d7ad85e2eba4d841d2f85d87e8ecb7c2a1c22b5595334dbc51cac0",
+    "rustler/src/main.rs": "7b3782a9088a560d23333d4c3ee5846773befa48a71e22881e12b8ae2e785356",
+    "rustler/Cargo.toml": "964786cd95bdba679b6c30c4be95fc9930237d3739ae0ef939aad5716ce35e36",
+    "rustler/Cargo.lock": "9dc408fc0b647dd34ce3282558dab91f377f020f576c3249024299cffc53c12a",
+    "rustler/pyproject.toml": "d4c2d7894fc1523fc69aa2c2d94fb16e179330ff1e3c84bab5e5f68010923bb7",
+    "pyproject.toml": "0d10af80e4e8b959a3f6be379012a0f99f72591308999326c3d190aa96da0719",
+    "pixi.lock": "e6dcb429fcab6bb80b32d02ea33ea978d136cf52da99f07abf2cc2ec47ffb2e2"
+  }
+}

@@ -1,3 +1,7 @@
+For the original **19M PLuREL-paper checkpoint**, use the isolated
+[paper-compatible experiment runtime](paper/README.md). The current `src/rt` model
+is a different architecture and cannot directly load those weights.
+
 # Relational Transformer (RT)
 
 The official implementation of the **Relational Transformer (RT)**, an

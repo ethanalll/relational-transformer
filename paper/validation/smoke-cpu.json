@@ -1,0 +1,45 @@
+{
+  "scope": "CPU diagnostic, full paper model, generated data",
+  "reports": {
+    "legacy_scm": {
+      "parameters": 19189635,
+      "steps": 10,
+      "tokens": 219,
+      "slots": 640,
+      "targets": 20,
+      "seconds": 1.4789542089856695,
+      "backend": "portable",
+      "diagnostic": true,
+      "checkpoint_tested": "seed-42 diagnostic initial state, not published weights",
+      "last_loss": 0.032957661896944046,
+      "parameter_tensors_updated": 328,
+      "checkpoint_reload_exact": true,
+      "reloaded_loss": 0.006562169641256332,
+      "training_databases": 2,
+      "held_out_validation_databases": 1,
+      "training_tasks": 23
+    },
+    "global_rscm": {
+      "parameters": 19189635,
+      "steps": 10,
+      "tokens": 216,
+      "slots": 640,
+      "targets": 20,
+      "seconds": 2.3639821670076344,
+      "backend": "portable",
+      "diagnostic": true,
+      "checkpoint_tested": "seed-42 diagnostic initial state, not published weights",
+      "last_loss": 0.2035931497812271,
+      "parameter_tensors_updated": 328,
+      "checkpoint_reload_exact": true,
+      "reloaded_loss": 0.7892165184020996,
+      "training_databases": 2,
+      "held_out_validation_databases": 1,
+      "training_tasks": 24
+    }
+  },
+  "published_checkpoint_tested": false,
+  "minilm_tested": false,
+  "native_sampler_tested": false,
+  "cuda_tested": false
+}

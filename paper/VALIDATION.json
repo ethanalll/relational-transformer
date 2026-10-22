@@ -1,0 +1,40 @@
+{
+  "tests": {
+    "passed": 9,
+    "command": "python -m pytest tests -q",
+    "checks": [
+      "lossless export",
+      "constant Boolean context/target eligibility",
+      "invalid FK rejection",
+      "static/nullable contexts",
+      "strict checkpoint rejection",
+      "partial batches",
+      "all task metrics",
+      "archived-source CPU forward parity",
+      "archived hashes",
+      "19M state size",
+      "exact interrupted resume"
+    ]
+  },
+  "smoke": "validation/smoke-cpu.json",
+  "cross_evaluation_tasks": 11,
+  "native_compile": {
+    "status": "blocked",
+    "reason": "offline Cargo registry missing dashmap"
+  },
+  "published_weights": "not available locally",
+  "minilm": "not installed/cached",
+  "cuda": "not available on this Mac",
+  "paper_scale_generation_and_export": {
+    "global_rscm-train-global_rscm-4ab42b85a269": {
+      "accepted": 1,
+      "tables": 12,
+      "tasks": 112
+    },
+    "legacy_scm-train-legacy_scm-1435fb2a07ae": {
+      "accepted": 1,
+      "tables": 16,
+      "tasks": 226
+    }
+  }
+}

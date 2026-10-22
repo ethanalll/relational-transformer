@@ -1,0 +1,61 @@
+[project]
+name = "plurel"
+requires-python = ">=3.12"
+version = "0.1.0"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+plurel = { path = ".", editable = true }
+torch = ">=2.8.0"
+sentence_transformers = "*"
+einops = "*"
+strictfire = "*"
+maturin = { version = "*", extras = ["patchelf"] }
+ml_dtypes = "*"
+orjson = "*"
+polars = "*"
+maturin_import_hook = "*"
+matplotlib = "*"
+scikit-learn = "<1.6.0"
+relbench = {git = "https://github.com/snap-stanford/relbench", rev = "71f5d50f3af25aa34ac1b9d3e093fa6d8e9b8459", extras = ["full"]}
+
+[tool.pixi.dependencies]
+pytest = ">=9.0.1,<10"
+pytest-xdist = ">=3.8.0,<4"
+pytest-sugar = ">=1.1.1,<2"
+sqlalchemy = ">=2.0.45,<3"
+pytest-env = ">=1.2.0,<2"
+ipython = ">=9.9.0,<10"
+pip = ">=25.3,<26"
+huggingface_hub = ">=1.3.7,<2"
+datasets = ">=4.5.0,<5"
+wandb = ">=0.24.1,<0.25"
+rust = "*"
+uv = "*"
+ruff = "*"
+pre-commit = ">=4.5.1,<5"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E402", "E501", "E721", "E741", "F841"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+env = ["KMP_DUPLICATE_LIB_OK=TRUE"]
