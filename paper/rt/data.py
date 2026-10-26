@@ -60,6 +60,9 @@ class RelationalDataset(Dataset):
                 [self.columns[db][f"{c} of {task.table_name}"] for c in task.columns_to_drop]
             )
         if backend == "native":
+            # Register NumPy's bfloat16 dtype before Rust returns half::bf16 arrays.
+            import ml_dtypes  # noqa: F401
+
             from rustler import Sampler
 
             self.sampler = Sampler(

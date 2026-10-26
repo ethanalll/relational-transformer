@@ -4,7 +4,8 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
   "torch==2.8.0", "numpy>=1.26,<3", "pandas>=2,<3", "pyarrow>=17,<24", "PyYAML>=6,<7",
-  "scikit-learn>=1.5,<1.6", "einops>=0.8,<0.9", "sentence-transformers>=3,<6"
+  "scikit-learn>=1.5,<1.6", "einops>=0.8,<0.9", "sentence-transformers>=3,<6",
+  "ml-dtypes>=0.5,<1"
 ]
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
