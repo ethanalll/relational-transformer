@@ -22,3 +22,5 @@ rkyv = "*"
 numpy = { version = "*", features = ["half"] }
 indicatif = "*"
 half = { version = "*", features = ["rkyv"] }
+rayon = "*"
+dashmap = "*"

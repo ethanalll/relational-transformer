@@ -1,11 +1,6 @@
-import maturin_import_hook
-from maturin_import_hook.settings import MaturinSettings
-
-maturin_import_hook.install(settings=MaturinSettings(release=True, uv=True))
-
 import json
-import os
 from functools import cache
+from pathlib import Path
 
 import ml_dtypes
 import numpy as np
@@ -15,24 +10,21 @@ from torch.utils.data import Dataset
 
 
 @cache
-def _load_column_index(db_name: str) -> dict:
+def _load_column_index(db_name: str, pre_dir: Path) -> dict:
     """
     Load the column index mapping for a dataset (cached).
     """
-    home = os.environ.get("HOME", ".")
-    column_index_path = os.path.join(
-        home, "scratch", "pre", db_name, "column_index.json"
-    )
+    column_index_path = pre_dir / db_name / "column_index.json"
 
     with open(column_index_path) as f:
         return json.load(f)
 
 
-def get_column_index(column_name: str, table_name: str, db_name: str) -> int:
+def get_column_index(column_name: str, table_name: str, db_name: str, pre_dir=None) -> int:
     """
     Get the index of a column in the text embeddings for a given dataset.
     """
-    column_index = _load_column_index(db_name)
+    column_index = _load_column_index(db_name, Path(pre_dir or Path.home() / "scratch/pre"))
     target = f"{column_name} of {table_name}"
 
     if target not in column_index:
@@ -55,7 +47,9 @@ class RelationalDataset(Dataset):
         embedding_model,
         d_text,
         seed,
+        pre_dir=None,
     ):
+        pre_dir = Path(pre_dir or Path.home() / "scratch/pre").expanduser().resolve()
         dataset_tuples = []
         target_column_indices = []
         drop_column_indices = []
@@ -68,9 +62,7 @@ class RelationalDataset(Dataset):
             elif split == "test":
                 split = "Test"
 
-            table_info_path = (
-                f"{os.environ['HOME']}/scratch/pre/{db_name}/table_info.json"
-            )
+            table_info_path = pre_dir / db_name / "table_info.json"
             with open(table_info_path) as f:
                 table_info = json.load(f)
 
@@ -83,11 +75,11 @@ class RelationalDataset(Dataset):
             node_idx_offset = info["node_idx_offset"]
             num_nodes = info["num_nodes"]
 
-            target_idx = get_column_index(target_column, table_name, db_name)
+            target_idx = get_column_index(target_column, table_name, db_name, pre_dir)
             target_column_indices.append(target_idx)
 
             drop_indices = [
-                get_column_index(col, table_name, db_name) for col in columns_to_drop
+                get_column_index(col, table_name, db_name, pre_dir) for col in columns_to_drop
             ]
             drop_column_indices.append(drop_indices)
 
@@ -96,7 +88,8 @@ class RelationalDataset(Dataset):
         self.sampler = Sampler(
             dataset_tuples=dataset_tuples,
             batch_size=batch_size,
-            seq_len=seq_len,
+            ctx_len=seq_len,
+            pre_dir=str(pre_dir),
             rank=rank,
             world_size=world_size,
             max_bfs_width=max_bfs_width,

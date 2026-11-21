@@ -1,5 +1,8 @@
 # Relational Transformer
 
+**RelRel experiments:** Use the [experiment runbook](EXPERIMENTS.md) for the PluRel-compatible model and the Make targets for staged data, training, and evaluation. For the original leaderboard checkpoints and workflow below, check out upstream `rt-v1`.
+
+
 This repository provides a reference implementation
 for the **ICLR 2026** paper: [Relational Transformer: Toward Zero-Shot Foundation Models for Relational Data](https://arxiv.org/abs/2510.06377).
 

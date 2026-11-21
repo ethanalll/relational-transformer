@@ -1,14 +1,9 @@
-import json
-import os
 from functools import partial
-from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from einops._torch_specific import allow_ops_in_compiled_graph
-from ml_dtypes import bfloat16
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -21,6 +16,8 @@ class MaskedAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
         self.num_heads = num_heads
+        self.q_norm = nn.RMSNorm(d_model // num_heads)
+        self.k_norm = nn.RMSNorm(d_model // num_heads)
 
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
@@ -36,7 +33,12 @@ class MaskedAttention(nn.Module):
         k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
 
-        if block_mask is None:
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if isinstance(block_mask, torch.Tensor):
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=block_mask[:, None])
+        elif block_mask is None:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 x = F.scaled_dot_product_attention(q, k, v)
         else:
@@ -68,25 +70,26 @@ class RelationalBlock(nn.Module):
     ):
         super().__init__()
 
+        self.attn_types = ("col", "feat", "nbr")
         self.norms = nn.ModuleDict(
-            {l: nn.RMSNorm(d_model) for l in ["feat", "nbr", "col", "full", "ffn"]}
+            {name: nn.RMSNorm(d_model) for name in (*self.attn_types, "ffn")}
         )
         self.attns = nn.ModuleDict(
-            {
-                l: MaskedAttention(d_model, num_heads)
-                for l in ["feat", "nbr", "col", "full"]
-            }
+            {name: MaskedAttention(d_model, num_heads) for name in self.attn_types}
         )
         self.ffn = FFN(d_model, d_ff)
 
     def forward(self, x, block_masks):
-        for l in ["col", "feat", "nbr", "full"]:
+        for l in self.attn_types:
             x = x + self.attns[l](self.norms[l](x), block_mask=block_masks[l])
         x = x + self.ffn(self.norms["ffn"](x))
         return x
 
 
 def _make_block_mask(mask, batch_size, seq_len, device):
+    if torch.device(device).type == "cpu":
+        return mask
+
     def _mod(b, h, q_idx, kv_idx):
         return mask[b, q_idx, kv_idx]
 
@@ -157,8 +160,6 @@ class RelationalTransformer(nn.Module):
         table_name_idxs = batch["table_name_idxs"]
         is_padding = batch["is_padding"]
         batch_size, seq_len = node_idxs.shape
-
-        batch_size, seq_len = node_idxs.shape
         device = node_idxs.device
 
         # Padding mask for attention pairs (allow only non-pad -> non-pad)
@@ -173,9 +174,7 @@ class RelationalTransformer(nn.Module):
         )  # (B, S, S)
 
         # q index is among kv's primary -> foreign neighbors (reverse relation)
-        q_in_f2p = (node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]).any(
-            -1
-        )  # (B, S, S)
+        q_in_f2p = kv_in_f2p.transpose(1, 2)
 
         # Same column AND same table
         same_col_table = (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) & (
@@ -187,7 +186,6 @@ class RelationalTransformer(nn.Module):
             "feat": (same_node | kv_in_f2p) & pad,
             "nbr": q_in_f2p & pad,
             "col": same_col_table & pad,
-            "full": pad,
         }
 
         # Make them contiguous for better kernel performance
@@ -228,7 +226,7 @@ class RelationalTransformer(nn.Module):
 
         x = self.norm_out(x)
 
-        loss_out = x.new_zeros(())
+        loss_per_seq = x.new_zeros(x.size(0))
         yhat_out = {"number": None, "text": None, "datetime": None, "boolean": None}
 
         B, S, _ = x.shape
@@ -243,7 +241,7 @@ class RelationalTransformer(nn.Module):
             if not sem_type_mask.any():
                 if t in yhat_out:
                     # still touch the param to avoid unused param error
-                    loss_out = loss_out + (yhat.sum() * 0.0)
+                    loss_per_seq = loss_per_seq + (yhat.sum() * 0.0)
                     yhat_out[t] = yhat
                 continue
 
@@ -256,12 +254,16 @@ class RelationalTransformer(nn.Module):
             elif t == "text":
                 raise ValueError("masking text not supported")
 
-            # masked sum for this type
-            loss_out = loss_out + (loss_t * sem_type_mask).sum()
+            loss_per_seq = loss_per_seq + (loss_t * sem_type_mask).sum(dim=1)
 
             if t in yhat_out:
                 yhat_out[t] = yhat
 
-        loss_out = loss_out / masks.sum()
+        # Native samplers pad the last batch with empty contexts.
+        masks_per_seq = masks.sum(dim=1)
+        nonempty = masks_per_seq > 0
+        loss_out = (
+            loss_per_seq / masks_per_seq.clamp_min(1).float()
+        ).sum() / nonempty.sum().clamp_min(1)
 
         return loss_out, yhat_out

@@ -56,6 +56,10 @@ pub struct Cli {
     db_name: String,
     #[arg(long, default_value_t = false)]
     skip_db: bool,
+    #[arg(long)]
+    input_dir: Option<String>,
+    #[arg(long)]
+    output_dir: Option<String>,
 }
 
 fn cast_col_to_bool(df: DataFrame, col_name: &str) -> Result<DataFrame, PolarsError> {
@@ -65,10 +69,8 @@ fn cast_col_to_bool(df: DataFrame, col_name: &str) -> Result<DataFrame, PolarsEr
 }
 
 pub fn main(cli: Cli) {
-    let dataset_path = format!("{}/scratch/relbench/{}", var("HOME").unwrap(), cli.db_name);
-
-    let dashes = dataset_path.matches("-").count();
-    dbg!(dashes);
+    let dataset_path = cli.input_dir.clone().unwrap_or_else(|| format!("{}/scratch/relbench/{}", var("HOME").unwrap(), cli.db_name));
+    println!("dataset_path {:?}", dataset_path);
 
     println!("reading tables...");
     let tic = Instant::now();
@@ -90,7 +92,8 @@ pub fn main(cli: Cli) {
                 .sorted(),
         ),
     ) {
-        if pq_path.to_str().unwrap().matches("-").count() == dashes + 2 {
+        // Only canonical task split files; directory hyphens carry no semantics.
+        if !is_db_table && !matches!(pq_path.file_stem().unwrap().to_str().unwrap(), "train" | "val" | "test") {
             continue;
         }
         dbg!(&pq_path);
@@ -172,6 +175,13 @@ pub fn main(cli: Cli) {
                 },
             )
         };
+
+        println!(
+            "read table {} of type {:?} with shape {:?}",
+            table_name,
+            table_type,
+            df.shape()
+        );
         let table_key = (table_name.clone(), table_type.clone());
 
         /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -180,19 +190,9 @@ pub fn main(cli: Cli) {
             make_column_boolean(&mut df, "LinkTypeId").unwrap();
         }
 
-        // if cli.db_name == "rel-stack" && table_name == "badges" {
-        //     make_column_boolean(&mut df, "TagBased").unwrap();
-
-        // }
         if cli.db_name == "rel-trial" && table_name == "studies" {
             make_column_boolean(&mut df, "has_dmc").unwrap();
         }
-        // // if cli.db_name == "rel-trial" && table_name == "designs" {
-        // //     make_column_boolean(&mut df, "allocation").unwrap();
-        // // }
-        // if cli.db_name == "rel-trial" && table_name == "studies" {
-        //     make_column_boolean(&mut df, "is_fda_regulated_device").unwrap();
-        // }
 
         if cli.db_name == "rel-trial" && table_name == "eligibilities" {
             for col in ["adult", "child", "older_adult"] {
@@ -200,9 +200,6 @@ pub fn main(cli: Cli) {
             }
         }
 
-        // if cli.db_name == "rel-event" && table_name == "users" {
-        //     make_column_boolean(&mut df, "gender").unwrap();
-        // }
         /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
         // amazon
@@ -218,8 +215,13 @@ pub fn main(cli: Cli) {
                     c.list()
                         .unwrap()
                         .into_iter()
-                        // XXX: takes only the first element
-                        .map(|l| l.map(|l| l.iter().next().unwrap().to_string()))
+                        .map(|list| {
+                            list.and_then(|values| {
+                                values.iter().next()
+                                    .filter(|value| !matches!(value, AnyValue::Null))
+                                    .map(|value| value.to_string())
+                            })
+                        })
                         .collect::<StringChunked>()
                         .into_column()
                 })
@@ -288,6 +290,68 @@ pub fn main(cli: Cli) {
             }
         }
 
+        if cli.db_name == "rel-ratebeer" {
+            if table_name == "beer-rating-churn" {
+                df = cast_col_to_bool(df, "rating_churn").unwrap();
+            }
+            if table_name == "user-rating-churn" {
+                df = cast_col_to_bool(df, "user_churn").unwrap();
+            }
+            if table_name == "brewer-dormant" {
+                df = cast_col_to_bool(df, "dormant").unwrap();
+            }
+            if table_name == "places" {
+                df = df.drop("has_flights").unwrap();
+                df = df.drop("has_food").unwrap();
+            }
+            if table_name == "beers" {
+                df = df.drop("is_retired").unwrap();
+            }
+            if table_name == "brewers" {
+                df = df.drop("has_logo").unwrap();
+                df = df.drop("is_out_of_business").unwrap();
+            }
+        }
+
+        if cli.db_name == "dbinfer-amazon" {
+            if table_name == "churn" {
+                df = cast_col_to_bool(df, "churn").unwrap();
+            }
+            if table_name == "purchase" {
+                continue;
+            }
+        }
+
+        if cli.db_name == "dbinfer-avs" && table_name == "repeater" {
+            df = cast_col_to_bool(df, "repeater").unwrap();
+        }
+
+        if cli.db_name == "dbinfer-diginetica" {
+            if table_name == "ctr" {
+                df = cast_col_to_bool(df, "clicked").unwrap();
+            }
+            if table_name == "purchase" {
+                continue;
+            }
+        }
+
+        if cli.db_name == "dbinfer-outbrain-small" && table_name == "ctr" {
+            df = cast_col_to_bool(df, "clicked").unwrap();
+        }
+
+        if cli.db_name == "dbinfer-retailrocket" && table_name == "cvr" {
+            df = cast_col_to_bool(df, "added_to_cart").unwrap();
+        }
+
+        if cli.db_name == "dbinfer-stackexchange" {
+            if table_name == "churn" {
+                df = cast_col_to_bool(df, "Target").unwrap();
+            }
+            if table_name == "upvote" {
+                df = cast_col_to_bool(df, "Target").unwrap();
+            }
+        }
+
         let num_rows = df.height() as i32;
         let num_cells = num_rows * df.width() as i32;
         table_map.insert(
@@ -319,15 +383,27 @@ pub fn main(cli: Cli) {
             match col.dtype() {
                 DataType::Boolean => {
                     let col_float = col.cast(&DataType::Float64).unwrap().drop_nulls();
-                    let col_mean = col_float.mean().unwrap_or(0.0);
-                    let col_std = col_float.std(1).unwrap_or(0.0);
+                    let mut col_mean = col_float.mean().unwrap_or(0.0);
+                    let mut col_std = col_float.std(1).unwrap_or(0.0);
+                    if !col_std.is_finite() || col_std == 0.0 {
+                        col_mean = 0.0; col_std = 1.0; // retain raw Boolean identity
+                    }
 
                     table.col_stats.push(ColStat {
                         mean: col_mean,
                         std: col_std,
                     });
+
+                    println!(
+                        "Column {} of table {}: boolean mean: {} std: {}",
+                        col.name(),
+                        table.table_name,
+                        col_mean,
+                        col_std
+                    );
                 }
                 DataType::UInt32
+                | DataType::Int16
                 | DataType::Int32
                 | DataType::Int64
                 | DataType::Float64
@@ -336,11 +412,18 @@ pub fn main(cli: Cli) {
                     let col = col.filter(&col.is_not_nan().unwrap()).unwrap();
                     let mean = col.mean().unwrap_or(0.0);
                     let std = col.std(1).unwrap_or(1.0);
-                    let std = if std == 0.0 { 1.0 } else { std };
+                    let std = if !std.is_finite() || std == 0.0 { 1.0 } else { std };
                     table.col_stats.push(ColStat { mean, std });
                 }
                 DataType::Datetime(u, _) => {
-                    assert!(*u == TimeUnit::Nanoseconds);
+                    // Convert to nanoseconds if needed (some datasets use microseconds)
+                    let col = if *u != TimeUnit::Nanoseconds {
+                        col.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))
+                            .unwrap()
+                    } else {
+                        col.clone()
+                    };
+                    assert!(*col.dtype() == DataType::Datetime(TimeUnit::Nanoseconds, None));
                     let col = col.cast(&DataType::Float64).unwrap().drop_nulls();
                     let col = col.filter(&col.is_not_nan().unwrap()).unwrap();
                     dt_cnt += col.len();
@@ -357,7 +440,7 @@ pub fn main(cli: Cli) {
                         .sum::<f64>();
                     // let mean = col.mean().unwrap_or(0.0);
                     // let std = col.std(1).unwrap_or(1.0);
-                    // let std = if std == 0.0 { 1.0 } else { std };
+                    // let std = if !std.is_finite() || std == 0.0 { 1.0 } else { std };
                     // table.col_stats.push(ColStat { mean, std });
                     table.col_stats.push(ColStat {
                         mean: 0.0,
@@ -372,8 +455,9 @@ pub fn main(cli: Cli) {
         }
     }
 
-    let dt_mean = dt_sum / dt_cnt as f64;
-    let dt_std = (dt_sum_sq / dt_cnt as f64 - dt_mean * dt_mean).sqrt();
+    let dt_mean = if dt_cnt > 0 { dt_sum / dt_cnt as f64 } else { 0.0 };
+    let dt_std = if dt_cnt > 0 { (dt_sum_sq / dt_cnt as f64 - dt_mean * dt_mean).max(0.0).sqrt() } else { 1.0 };
+    let dt_std = if dt_std.is_finite() && dt_std > 0.0 { dt_std } else { 1.0 };
     dbg!(dt_cnt);
     dbg!(dt_sum);
     dbg!(dt_sum_sq);
@@ -429,6 +513,18 @@ pub fn main(cli: Cli) {
         for (col, col_stat) in table.df.iter().zip(&table.col_stats) {
             let col = col.rechunk();
 
+            // Convert datetime columns to nanoseconds if needed
+            let col = if let DataType::Datetime(unit, tz) = col.dtype() {
+                if *unit != TimeUnit::Nanoseconds {
+                    col.cast(&DataType::Datetime(TimeUnit::Nanoseconds, tz.clone()))
+                        .unwrap()
+                } else {
+                    col
+                }
+            } else {
+                col
+            };
+
             let col_name = format!("{} of {}", col.name(), table.table_name.clone());
             let l = text_to_idx.len() as i32;
             let col_name_idx = *text_to_idx.entry(col_name.clone()).or_insert_with(|| {
@@ -445,6 +541,11 @@ pub fn main(cli: Cli) {
                 .fcol_name_to_ptable_name
                 .contains_key(&col.name().to_string())
             {
+                if matches!(col.dtype(), polars::datatypes::DataType::Datetime(_, _)) {
+                    pbar.inc(col.len() as u64);
+                    continue;
+                }
+
                 let ptable_name = table
                     .fcol_name_to_ptable_name
                     .get(&col.name().to_string())
@@ -539,10 +640,16 @@ pub fn main(cli: Cli) {
                 node.is_task_node = table_type != &TableType::Db;
                 node.node_idx = node_idx;
                 node.table_name_idx = table_name_idx;
+                node.timestamp = table.tcol_name.as_ref().and_then(|c| {
+                    let col = table.df.column(c).unwrap();
+                    let ns = col.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None)).unwrap();
+                    ns.datetime().unwrap().get(r).map(|v| (v / 1_000_000_000) as i32)
+                });
 
                 let val = match val {
                     AnyValue::Boolean(val) => AnyValue::Boolean(val),
                     AnyValue::UInt32(val) => AnyValue::Float64(val as f64),
+                    AnyValue::Int16(val) => AnyValue::Float64(val as f64),
                     AnyValue::Int32(val) => AnyValue::Float64(val as f64),
                     AnyValue::Int64(val) => AnyValue::Float64(val as f64),
                     AnyValue::Float32(val) => AnyValue::Float64(val as f64),
@@ -616,7 +723,7 @@ pub fn main(cli: Cli) {
     pbar.finish();
     println!("done in {:?}.", tic.elapsed());
 
-    let pre_path = format!("{}/scratch/pre/{}", var("HOME").unwrap(), cli.db_name);
+    let pre_path = cli.output_dir.clone().unwrap_or_else(|| format!("{}/scratch/pre/{}", var("HOME").unwrap(), cli.db_name));
     fs::create_dir_all(Path::new(&pre_path)).unwrap();
 
     println!("writing out text...");
@@ -688,6 +795,13 @@ pub fn main(cli: Cli) {
     let mut writer = BufWriter::new(file);
     let bytes = rkyv::to_bytes::<Error>(&Offsets { offsets }).unwrap();
     writer.write_all(&bytes).unwrap();
+
+    println!("sorting p2f edges by timestamp...");
+    let tic_sort = Instant::now();
+    for edges in &mut p2f_adj.adj {
+        edges.sort_by_key(|edge| edge.timestamp);
+    }
+    println!("sorted p2f edges in {:?}", tic_sort.elapsed());
 
     println!("writing out p2f_adj...");
     let file = fs::File::create(format!("{}/p2f_adj.rkyv", pre_path)).unwrap();

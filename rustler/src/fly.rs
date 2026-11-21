@@ -16,6 +16,7 @@ use rand::seq::SliceRandom;
 use rand::seq::index;
 use rkyv::rancor::Error;
 use rkyv::vec::ArchivedVec;
+use std::collections::HashMap;
 use std::env::var;
 use std::fs;
 use std::io::{BufReader, Read};
@@ -87,7 +88,11 @@ impl Vecs {
         }
     }
 
-    fn chunks_exact_mut(&mut self, seq_len: usize, d_text: usize) -> impl Iterator<Item = Slices> {
+    fn chunks_exact_mut(
+        &mut self,
+        seq_len: usize,
+        d_text: usize,
+    ) -> impl Iterator<Item = Slices<'_>> {
         izip!(
             self.node_idxs.chunks_exact_mut(seq_len),
             self.f2p_nbr_idxs.chunks_exact_mut(seq_len * MAX_F2P_NBRS),
@@ -104,7 +109,7 @@ impl Vecs {
             self.is_targets.chunks_exact_mut(seq_len),
             self.is_task_nodes.chunks_exact_mut(seq_len),
             self.is_padding.chunks_exact_mut(seq_len),
-            self.timestamps.chunks_exact_mut(seq_len),
+            self.timestamps.chunks_exact_mut(seq_len)
         )
         .map(
             |(
@@ -231,17 +236,19 @@ struct Item {
 #[pyclass]
 pub struct Sampler {
     batch_size: usize,
-    seq_len: usize,
     rank: usize,
     world_size: usize,
     datasets: Vec<Dataset>,
+    dataset_by_task: Vec<usize>,
     items: Vec<Item>,
+    ctx_len: usize,
     max_bfs_width: usize,
     epoch: u64,
     d_text: usize,
     seed: u64,
     target_columns: Vec<i32>,
     columns_to_drop: Vec<Vec<i32>>,
+    dataset_tuples: Vec<(String, i32, i32)>, // (db_name, node_idx_offset, num_nodes) for each dataset
 }
 
 #[pymethods]
@@ -251,20 +258,29 @@ impl Sampler {
     fn new(
         dataset_tuples: Vec<(String, i32, i32)>,
         batch_size: usize,
-        seq_len: usize,
         rank: usize,
         world_size: usize,
+        ctx_len: usize,
         max_bfs_width: usize,
         embedding_model: &str,
         d_text: usize,
         seed: u64,
         target_columns: Vec<i32>,
         columns_to_drop: Vec<Vec<i32>>,
+        pre_dir: String,
     ) -> Self {
         let mut datasets = Vec::new();
-        let mut items = Vec::new();
-        for (i, (db_name, node_idx_offset, num_nodes)) in dataset_tuples.into_iter().enumerate() {
-            let pre_path = format!("{}/scratch/pre/{}", var("HOME").unwrap(), db_name);
+        let mut dataset_by_task = Vec::with_capacity(dataset_tuples.len());
+        let mut indices = HashMap::new();
+
+        for (db_name, _node_idx_offset, _num_nodes) in dataset_tuples.iter() {
+            if let Some(&index) = indices.get(db_name) {
+                dataset_by_task.push(index);
+                continue;
+            }
+            indices.insert(db_name.clone(), datasets.len());
+            dataset_by_task.push(datasets.len());
+            let pre_path = format!("{}/{}", pre_dir, db_name);
             let nodes_path = format!("{}/nodes.rkyv", pre_path);
             let file = fs::File::open(&nodes_path).unwrap();
             let mmap = unsafe { Mmap::map(&file).unwrap() };
@@ -284,7 +300,6 @@ impl Sampler {
             let p2f_adj_path = format!("{}/p2f_adj.rkyv", pre_path);
             let p2f_adj_file = fs::File::open(&p2f_adj_path).unwrap();
             let p2f_adj_mmap = unsafe { Mmap::map(&p2f_adj_file).unwrap() };
-            let target = target_columns[i];
 
             datasets.push(Dataset {
                 mmap,
@@ -292,34 +307,28 @@ impl Sampler {
                 p2f_adj_mmap,
                 offsets,
             });
-
-            for j in node_idx_offset..node_idx_offset + num_nodes {
-                let node = get_node(&datasets[i], j);
-                // skip the node if target column was removed during preprocessing
-                if node.col_name_idxs.iter().any(|&c| c == target) {
-                    items.push(Item {
-                        dataset_idx: i as i32,
-                        node_idx: j,
-                    });
-                }
-            }
         }
 
         let epoch = 0;
-        Self {
+        let mut sampler = Self {
             batch_size,
-            seq_len,
             rank,
             world_size,
             datasets,
-            items,
+            dataset_by_task,
+            items: Vec::new(), // Will be populated by create_items
+            ctx_len,
             max_bfs_width,
             epoch,
             d_text,
             seed,
             target_columns,
             columns_to_drop,
-        }
+            dataset_tuples,
+        };
+
+        sampler.create_items(0);
+        sampler
     }
 
     fn len_py(&self) -> PyResult<usize> {
@@ -332,58 +341,217 @@ impl Sampler {
 
     fn shuffle_py(&mut self, epoch: u64) {
         self.epoch = epoch;
-        let mut rng = StdRng::seed_from_u64(epoch.wrapping_add(self.seed));
-        self.items.shuffle(&mut rng);
+        self.create_items(epoch);
     }
 }
 
 impl Sampler {
+    /// Rebuild items list with epoch-based random sampling (so also shuffling the items).
+    fn create_items(&mut self, epoch: u64) {
+        self.items.clear();
+
+        let num_tasks = self.dataset_tuples.len() as u64;
+
+        for (i, &(_, node_idx_offset, num_nodes)) in self.dataset_tuples.iter().enumerate() {
+            let target = self.target_columns[i];
+
+            let rng_seed = self.seed + (epoch * num_tasks) + (i as u64);
+            let mut rng = StdRng::seed_from_u64(rng_seed);
+
+            let sampled_indices = index::sample(&mut rng, num_nodes as usize, num_nodes as usize);
+
+            for idx in sampled_indices.iter() {
+                let node_idx = node_idx_offset + idx as i32;
+                let node = get_node(&self.datasets[self.dataset_by_task[i]], node_idx);
+
+                // Skip if node doesn't have target column
+                if node.col_name_idxs.iter().any(|&c| c == target) {
+                    self.items.push(Item {
+                        dataset_idx: i as i32,
+                        node_idx,
+                    });
+                }
+            }
+        }
+
+        // Shuffle the entire items list
+        let mut rng = StdRng::seed_from_u64((self.seed << 32) | (epoch & 0xFFFFFFFF));
+        self.items.shuffle(&mut rng);
+    }
+
     fn len(&self) -> usize {
         self.items.len().div_ceil(self.batch_size * self.world_size)
     }
 
     fn batch(&self, batch_idx: usize) -> Vecs {
-        let true_batch_size = self.batch_size.min(
-            self.items.len()
-                - self.rank * self.batch_size
-                - batch_idx * self.batch_size * self.world_size,
-        );
+        let start = (batch_idx * self.world_size + self.rank) * self.batch_size;
+        let true_batch_size = self.batch_size.min(self.items.len().saturating_sub(start));
 
-        let mut vecs = Vecs::new(self.batch_size, self.seq_len, true_batch_size, self.d_text);
-        vecs.chunks_exact_mut(self.seq_len, self.d_text)
+        let mut vecs = Vecs::new(self.batch_size, self.ctx_len, true_batch_size, self.d_text);
+
+        // Parallelize batch processing across sequences
+        vecs.chunks_exact_mut(self.ctx_len, self.d_text)
             .enumerate()
             .for_each(|(i, slices)| {
-                let j =
-                    batch_idx * self.batch_size * self.world_size + self.rank * self.batch_size + i;
-                // when self.batch_size > true_batch_size, this will wrap around
-                let j = j % self.items.len();
+                // Keep the paper's fixed-size batches, wrapping the final batch.
+                let j = (start + i) % self.items.len();
                 let item = &self.items[j];
                 self.seq(item, slices);
             });
         vecs
     }
 
-    fn seq(&self, item: &Item, slices: Slices) {
-        let dataset = &self.datasets[item.dataset_idx as usize];
+    fn seq(&self, item: &Item, mut slices: Slices) {
+        let dataset = &self.datasets[self.dataset_by_task[item.dataset_idx as usize]];
         let target_column = self.target_columns[item.dataset_idx as usize];
-        //define let columns to drop which is a vector of i32 and is at the same index as target_columns
         let columns_to_drop = &self.columns_to_drop[item.dataset_idx as usize];
-        let seed_node_idx = item.node_idx;
 
-        let mut visited = vec![false; dataset.offsets.len() - 1];
+        let target_node_idx = item.node_idx;
+        let target_node = get_node(dataset, target_node_idx);
 
-        let mut f2p_ftr = vec![(0, seed_node_idx)];
-        let seed_node = get_node(dataset, seed_node_idx);
-        let mut p2f_ftr = Vec::<Vec<_>>::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut visited_at_depth: HashMap<i32, usize> = HashMap::new();
 
-        let mut seq_i = 0;
+        let mut cells_to_add: Vec<(i32, usize, i32)> = Vec::new();
+
         let mut rng = StdRng::seed_from_u64(
-            self.epoch
-                .wrapping_add(seed_node_idx as u64)
-                .wrapping_add(self.seed),
+            ((self.seed << 32) | (self.epoch & 0xFFFFFFFF)) ^ (target_node_idx as u64),
         );
+        let bfs_nodes = self.bfs_collect_nodes(
+            dataset,
+            target_node_idx,
+            &mut rng,
+            self.ctx_len,
+            &mut visited_at_depth,
+        );
+
+        for bfs_node_idx in bfs_nodes {
+            if visited.contains(&bfs_node_idx) {
+                continue;
+            }
+            visited.insert(bfs_node_idx);
+
+            let node = get_node(dataset, bfs_node_idx);
+            for cell_i in 0..node.col_name_idxs.len() {
+                let col_idx: i32 = node.col_name_idxs[cell_i].into();
+
+                // Skip columns to drop
+                if (node.node_idx == target_node_idx && columns_to_drop.contains(&col_idx))
+                    || (node.timestamp == target_node.timestamp
+                        && columns_to_drop.contains(&col_idx))
+                {
+                    continue;
+                }
+
+                cells_to_add.push((bfs_node_idx, cell_i, col_idx));
+
+                if cells_to_add.len() == self.ctx_len {
+                    break;
+                }
+            }
+
+            if cells_to_add.len() == self.ctx_len {
+                break;
+            }
+        }
+
+        // Sort by column index
+        cells_to_add.sort_by_key(|&(_, _, col_idx)| col_idx);
+
+        // Add cells to sequence in sorted order
+        let mut seq_i = 0;
+        for (node_idx, cell_i, _col_idx) in cells_to_add.iter() {
+            if seq_i >= self.ctx_len {
+                break;
+            }
+
+            self.add_single_cell(
+                dataset,
+                *node_idx,
+                *cell_i,
+                target_node_idx,
+                target_column,
+                &mut seq_i,
+                &mut slices,
+            );
+        }
+    }
+
+    /// Add a single cell from a node to the sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn add_single_cell(
+        &self,
+        dataset: &Dataset,
+        node_idx: i32,
+        cell_i: usize,
+        target_node_idx: i32,
+        target_column: i32,
+        seq_i: &mut usize,
+        slices: &mut Slices,
+    ) {
+        let node = get_node(dataset, node_idx);
+
+        slices.node_idxs[*seq_i] = node.node_idx.into();
+
+        assert!(node.f2p_nbr_idxs.len() <= MAX_F2P_NBRS);
+        for (j, f2p_nbr_idx) in node.f2p_nbr_idxs.iter().enumerate() {
+            slices.f2p_nbr_idxs[*seq_i * MAX_F2P_NBRS + j] = f2p_nbr_idx.into();
+        }
+
+        slices.table_name_idxs[*seq_i] = node.table_name_idx.into();
+        slices.col_name_idxs[*seq_i] = node.col_name_idxs[cell_i].into();
+        slices.class_value_idxs[*seq_i] = node.class_value_idx[cell_i].into();
+        slices.col_name_values[*seq_i * self.d_text..(*seq_i + 1) * self.d_text].copy_from_slice(
+            get_text_emb(dataset, slices.col_name_idxs[*seq_i], self.d_text),
+        );
+
+        slices.sem_types[*seq_i] = node.sem_types[cell_i].clone() as i32;
+        slices.number_values[*seq_i] = bf16::from_f32(node.number_values[cell_i].into());
+
+        let text_idx: i32 = node.text_values[cell_i].into();
+        slices.text_values[*seq_i * self.d_text..(*seq_i + 1) * self.d_text]
+            .copy_from_slice(get_text_emb(dataset, text_idx, self.d_text));
+
+        slices.datetime_values[*seq_i] = bf16::from_f32(node.datetime_values[cell_i].into());
+        slices.boolean_values[*seq_i] = bf16::from_f32(node.boolean_values[cell_i].into());
+
+        slices.is_targets[*seq_i] =
+            node.node_idx == target_node_idx && node.col_name_idxs[cell_i] == target_column;
+        slices.masks[*seq_i] = slices.is_targets[*seq_i];
+
+        slices.is_task_nodes[*seq_i] =
+            node.is_task_node || (node.col_name_idxs[cell_i] == target_column);
+        slices.is_padding[*seq_i] = false;
+        slices.timestamps[*seq_i] = match node.timestamp.as_ref() {
+            Some(ts) => (*ts).into(),
+            None => i32::MIN,
+        };
+
+        *seq_i += 1;
+    }
+
+    /// Performs BFS to collect nodes for context.
+    fn bfs_collect_nodes(
+        &self,
+        dataset: &Dataset,
+        start_idx: i32,
+        rng: &mut StdRng,
+        max_cells: usize,
+        visited_at_depth: &mut HashMap<i32, usize>,
+    ) -> Vec<i32> {
+        let mut result = Vec::new();
+
+        let start_node = get_node(dataset, start_idx);
+        let mut num_cells = 0;
+
+        // Two frontier data structures:
+        // f2p_ftr: stack of (depth, node_idx) for f2p edges
+        // p2f_ftr: vector of vectors, one per depth level, for p2f edges
+        let mut f2p_ftr: Vec<(usize, i32)> = Vec::new();
+        let mut p2f_ftr: Vec<Vec<i32>> = vec![vec![start_idx]];
+
         loop {
-            // select node
+            // Select node
             let (depth, node_idx) = if !f2p_ftr.is_empty() {
                 f2p_ftr.pop().unwrap()
             } else {
@@ -394,7 +562,7 @@ impl Sampler {
                     }
                 }
                 if depth_choices.is_empty() {
-                    return;
+                    return result;
                 } else {
                     let depth = depth_choices[0];
                     let r = rng.random_range(0..p2f_ftr[depth].len());
@@ -405,30 +573,51 @@ impl Sampler {
                 }
             };
 
-            if visited[node_idx as usize] {
+            // Check if node was visited at a depth <= current depth
+            if let Some(&prev_depth) = visited_at_depth.get(&node_idx)
+                && prev_depth <= depth
+            {
                 continue;
             }
-            visited[node_idx as usize] = true;
 
             let node = get_node(dataset, node_idx);
 
+            // Update number of cells collected
+            num_cells += node.col_name_idxs.len();
+            if num_cells >= max_cells {
+                return result;
+            }
+
+            // Record the depth at which this node was visited
+            visited_at_depth.insert(node_idx, depth);
+
+            result.push(node_idx);
+
+            // Add f2p edges to f2p frontier
             for edge in node.f2p_edges.iter() {
                 f2p_ftr.push((depth + 1, edge.node_idx.into()));
             }
 
+            // Get p2f edges and process them
             let p2f_edges = get_p2f_edges(dataset, node_idx);
 
-            // temporary storage for db edges to be subsampled
+            // Temporary storage for db edges to be subsampled
             let mut db_p2f_ftr: Vec<i32> = Vec::new();
+
+            // The edges are sorted by timestamp, so we can binary search to find valid ones
+            let valid_edges = p2f_edges.as_slice().partition_point(|edge| {
+                edge.timestamp.is_none()
+                    || (start_node.timestamp.is_some() && edge.timestamp <= start_node.timestamp)
+            });
+
+            // Filter valid edges by table constraints
+            let p2f_edges = &p2f_edges.as_slice()[..valid_edges];
 
             for edge in p2f_edges.iter() {
                 // include edges to task table only if seed node belongs to the task table
-                if edge.table_name_idx != seed_node.table_name_idx && edge.table_type != ArchivedTableType::Db {
-                    continue;
-                }
-
-                // temporal constraint
-                if edge.timestamp.is_some() && seed_node.timestamp.is_some() && edge.timestamp > seed_node.timestamp {
+                if edge.table_name_idx != start_node.table_name_idx
+                    && edge.table_type != ArchivedTableType::Db
+                {
                     continue;
                 }
 
@@ -445,8 +634,9 @@ impl Sampler {
                 p2f_ftr[depth + 1].push(edge.node_idx.into());
             }
 
+            // Subsample DB edges based on max_bfs_width
             let idxs = if db_p2f_ftr.len() > self.max_bfs_width {
-                index::sample(&mut rng, db_p2f_ftr.len(), self.max_bfs_width).into_vec()
+                index::sample(rng, db_p2f_ftr.len(), self.max_bfs_width).into_vec()
             } else {
                 (0..db_p2f_ftr.len()).collect::<Vec<_>>()
             };
@@ -459,67 +649,6 @@ impl Sampler {
                 }
                 p2f_ftr[depth + 1].push(db_p2f_ftr[*idx]);
             }
-
-            let num_cells = node.col_name_idxs.len();
-            for cell_i in 0..num_cells {
-                let col_idx: i32 = node.col_name_idxs[cell_i].into();
-                if (node.node_idx == seed_node_idx && columns_to_drop.contains(&col_idx))
-                    || (node.timestamp == seed_node.timestamp && columns_to_drop.contains(&col_idx))
-                {
-                    continue; // do not add this cell to the sequence
-                }
-                slices.node_idxs[seq_i] = node.node_idx.into();
-
-                assert!(node.f2p_nbr_idxs.len() <= MAX_F2P_NBRS);
-                for (j, f2p_nbr_idx) in node.f2p_nbr_idxs.iter().enumerate() {
-                    slices.f2p_nbr_idxs[seq_i * MAX_F2P_NBRS + j] = f2p_nbr_idx.into();
-                }
-
-                slices.table_name_idxs[seq_i] = node.table_name_idx.into();
-                slices.col_name_idxs[seq_i] = node.col_name_idxs[cell_i].into();
-                slices.class_value_idxs[seq_i] = node.class_value_idx[cell_i].into();
-                slices.col_name_values[seq_i * self.d_text..(seq_i + 1) * self.d_text]
-                    .copy_from_slice(get_text_emb(
-                        dataset,
-                        slices.col_name_idxs[seq_i],
-                        self.d_text,
-                    ));
-
-                let s = node.sem_types[cell_i].clone() as i32;
-                slices.sem_types[seq_i] = s;
-
-                slices.number_values[seq_i] = bf16::from_f32(node.number_values[cell_i].into());
-
-                let text_idx: i32 = node.text_values[cell_i].into();
-                slices.text_values[seq_i * self.d_text..(seq_i + 1) * self.d_text]
-                    .copy_from_slice(get_text_emb(dataset, text_idx, self.d_text));
-
-                slices.datetime_values[seq_i] = bf16::from_f32(node.datetime_values[cell_i].into());
-
-                slices.boolean_values[seq_i] = bf16::from_f32(node.boolean_values[cell_i].into());
-
-                let is_target = seed_node_idx == node.node_idx
-                    && node.col_name_idxs[cell_i] == target_column;
-                slices.is_targets[seq_i] = is_target;
-
-                slices.masks[seq_i] = is_target;
-
-                slices.is_task_nodes[seq_i] =
-                    node.is_task_node || (node.col_name_idxs[cell_i] == target_column);
-                slices.is_padding[seq_i] = false;
-                slices.timestamps[seq_i] = match node.timestamp.as_ref() {
-                    Some(ts) => (*ts).into(),
-                    None => i32::MIN,
-                };
-
-                seq_i += 1;
-                if seq_i >= self.seq_len {
-                    break;
-                }
-            }
-            if seq_i >= self.seq_len {
-                break;
-            }
         }
     }
 }
@@ -528,7 +657,6 @@ fn get_node(dataset: &Dataset, idx: i32) -> &ArchivedNode {
     let l = dataset.offsets[idx as usize] as usize;
     let r = dataset.offsets[(idx + 1) as usize] as usize;
     let bytes = &dataset.mmap[l..r];
-    // rkyv::access::<ArchivedNode, Error>(bytes).unwrap()
     unsafe { rkyv::access_unchecked::<ArchivedNode>(bytes) }
 }
 
@@ -561,15 +689,16 @@ pub fn main(cli: Cli) {
     let sampler = Sampler::new(
         vec![(cli.db_name, 0, 10)], // dataset_tuples
         cli.batch_size,             // batch_size
-        cli.seq_len,                // seq_len
         0,                          // rank
         1,                          // world_size
-        256,                        // max_bfs_width
+        cli.seq_len,                // ctx_len
+        128,                        // max_bfs_width
         "all-MiniLM-L12-v2",        // embedding_model
         384,                        // d_text
         0,                          // seed
         vec![-1; 1],                // target_columns
         vec![Vec::<i32>::new()],    // columns_to_drop
+        format!("{}/scratch/pre", var("HOME").unwrap()),
     );
     println!("Sampler loaded in {:?}", tic.elapsed());
 
