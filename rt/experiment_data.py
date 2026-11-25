@@ -12,6 +12,7 @@ from .tasks import forecast_clf_tasks, forecast_reg_tasks
 
 ROOT = Path(__file__).resolve().parents[1]
 MINILM = "all-MiniLM-L12-v2"
+FORECAST_PROTOCOL = "forecast-v1"
 REL_BENCH_TASKS = [
     [*task, kind]
     for kind, group in (("clf", forecast_clf_tasks), ("reg", forecast_reg_tasks))
@@ -50,6 +51,25 @@ def relbench_tasks(selection):
     return REL_BENCH_TASKS
 
 
+def forecast_cache(root):
+    return root / "relbench/pre" / FORECAST_PROTOCOL
+
+
+def forecast_policy(database, table, split):
+    from relbench.tasks import get_task
+
+    task = get_task(database, table)
+    cutoff = (
+        task.dataset.test_timestamp if split == "test" else task.dataset.val_timestamp
+    )
+    horizon = task.timedelta.total_seconds()
+    if horizon <= 0 or not horizon.is_integer():
+        raise ValueError(
+            f"Invalid forecast horizon for {database}/{table}: {task.timedelta}"
+        )
+    return split == "test", int(horizon), cutoff.value // 1_000_000_000
+
+
 def download_relbench(root, selection):
     raw = root / "relbench/raw"
     os.environ["RELBENCH_CACHE_DIR"] = str(raw)
@@ -79,9 +99,20 @@ def source_signature(path):
 
 def preprocess(root, suite, split, arm, selection, device, native_bin, model_path):
     if suite == "relbench":
-        raw, pre = root / "relbench/raw", root / "relbench/pre"
+        raw, pre = root / "relbench/raw", forecast_cache(root)
         tasks = relbench_tasks(selection)
         names = sorted({task[0] for task in tasks})
+        policies = {
+            name: {
+                table: {
+                    split: forecast_policy(name, table, split)
+                    for split in ("val", "test")
+                }
+                for db, table, *_ in tasks
+                if db == name
+            }
+            for name in names
+        }
         origin = None
         manifest = None
     else:
@@ -114,6 +145,12 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
             "paper_cache": 1,
             "preprocessor_sha256": preprocessor,
         }
+        native_args = []
+        if suite == "relbench":
+            # Train-only statistics are available at both forecast split cutoffs.
+            cutoff = min(task["val"][2] for task in policies[name].values())
+            meta.update(forecast_protocol=FORECAST_PROTOCOL, stats_cutoff=cutoff)
+            native_args = ["--stats-cutoff", str(cutoff)]
         required = (*NATIVE_FILES, f"text_emb_{MINILM}.bin")
         if output.exists():
             if read_json(output / "source.json") != meta or not all(
@@ -144,6 +181,7 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
                         str(source),
                         "--output-dir",
                         str(stage),
+                        *native_args,
                     ],
                     check=True,
                 )
@@ -187,6 +225,7 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
             "tasks": tasks,
             "sources": sources,
             "databases": manifest["databases"] if manifest else names,
+            **({"forecast_policies": policies} if suite == "relbench" else {}),
         },
     )
 

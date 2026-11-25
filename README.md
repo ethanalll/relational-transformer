@@ -1,6 +1,6 @@
 # Relational Transformer
 
-**RelRel experiments:** Use the [experiment runbook](EXPERIMENTS.md) for the PluRel-compatible model and the Make targets for staged data, training, and evaluation. For the original leaderboard checkpoints and workflow below, check out upstream `rt-v1`.
+**RelRel experiments:** Use the [experiment runbook](EXPERIMENTS.md) for the PluRel-compatible model and the Make targets for staged data and training. The runbook's `make evaluate` command uses leakage-corrected RelBench forecast contexts. For the original leaderboard checkpoints and workflow below, check out upstream `rt-v1`.
 
 
 This repository provides a reference implementation

@@ -15,7 +15,15 @@ import torch.distributed as dist
 from sklearn.metrics import r2_score, roc_auc_score
 from torch.nn.parallel import DistributedDataParallel
 
-from .experiment_data import MINILM, ROOT, digest, read_json, write_json
+from .experiment_data import (
+    FORECAST_PROTOCOL,
+    MINILM,
+    ROOT,
+    digest,
+    forecast_cache,
+    read_json,
+    write_json,
+)
 from .model import RelationalTransformer
 
 DIMS = {"num_blocks": 12, "d_model": 256, "d_text": 384, "num_heads": 8, "d_ff": 1024}
@@ -57,7 +65,17 @@ def batch_for(model, batch):
     }
 
 
-def dataset(path, tasks, split, config, *, shuffle_seed, rank=0, world_size=1):
+def dataset(
+    path,
+    tasks,
+    split,
+    config,
+    *,
+    shuffle_seed,
+    rank=0,
+    world_size=1,
+    forecast_policies=None,
+):
     from .data import RelationalDataset
 
     converted = [(db, table, col, split, drops) for db, table, col, drops, _ in tasks]
@@ -72,6 +90,7 @@ def dataset(path, tasks, split, config, *, shuffle_seed, rank=0, world_size=1):
         d_text=384,
         seed=shuffle_seed,
         pre_dir=path,
+        forecast_policies=forecast_policies,
     )
     if not len(data):
         raise ValueError(f"No eligible target rows in {path}")
@@ -317,7 +336,7 @@ def launch_training(args, root, out, device):
 
 
 @torch.inference_mode()
-def score(model, data, kind, limit):
+def score(model, data, kind, limit, *, forecast=False):
     preds, targets = [], []
     weighted_loss = 0.0
     channel = "boolean" if kind == "clf" else "number"
@@ -325,7 +344,6 @@ def score(model, data, kind, limit):
         raw_batch = data[index]
         actual = raw_batch["true_batch_size"]
         batch = batch_for(model, raw_batch)
-        _, output = model(batch)
         # The paper sampler wraps the last batch. Evaluate each real row once.
         mask = batch["is_targets"][:actual]
         if not (mask.sum(dim=1) == 1).all():
@@ -334,6 +352,14 @@ def score(model, data, kind, limit):
         if not (batch["sem_types"][:actual][mask] == expected_type).all():
             raise ValueError(f"Sampler target type disagrees with manifest ({kind})")
         y = batch[f"{channel}_values"][:actual][mask].flatten().float()
+        if forecast:
+            # Keep the label for the scorer and pass only a masked placeholder to RT.
+            focal = batch["is_targets"]
+            if not batch["masks"][focal].all():
+                raise ValueError("Forecast query is missing its target mask")
+            field = f"{channel}_values"
+            batch[field] = batch[field].masked_fill(focal[..., None], 0)
+        _, output = model(batch)
         predictions = output[channel][:actual][mask].flatten().float()
         if not torch.isfinite(predictions).all() or not torch.isfinite(y).all():
             raise ValueError("Nonfinite prediction or target")
@@ -362,7 +388,8 @@ def score(model, data, kind, limit):
 
 
 def evaluate(args, root, out, device):
-    if args.eval == "synthetic":
+    forecast = args.eval != "synthetic"
+    if not forecast:
         pre = root / "synthetic/pre/holdout/val/reference"
         corpus, splits = pre / "corpus.json", ("val",)
         if not args.checkpoint:
@@ -373,16 +400,28 @@ def evaluate(args, root, out, device):
             if tunable & {item["seed"] for item in read_json(corpus)["databases"]}:
                 raise ValueError("Training and holdout seeds intersect")
     else:
-        pre = root / "relbench/pre"
+        pre = forecast_cache(root)
         corpus, splits = pre / f"{args.eval}.json", ("val", "test")
+        if not corpus.is_file():
+            raise FileNotFoundError(
+                f"Missing {corpus}. Run make preprocess-relbench for this DATA and EVAL."
+            )
+    manifest = read_json(corpus)
     checkpoint = args.checkpoint or out / "model.pt"
     model = build_model(device).eval()
     load_weights(model, torch.load(checkpoint, weights_only=True, map_location="cpu"))
     records = []
     for split in splits:
-        for task in read_json(corpus)["tasks"]:
-            data = dataset(pre, [task], split, vars(args), shuffle_seed=0)
-            record = score(model, data, task[-1], args.eval_batches)
+        for task in manifest["tasks"]:
+            data = dataset(
+                pre,
+                [task],
+                split,
+                vars(args),
+                shuffle_seed=0,
+                forecast_policies=manifest["forecast_policies"] if forecast else None,
+            )
+            record = score(model, data, task[-1], args.eval_batches, forecast=forecast)
             record.update(database=task[0], table=task[1], target=task[2], split=split)
             records.append(record)
             print(
@@ -390,12 +429,13 @@ def evaluate(args, root, out, device):
                 flush=True,
             )
     write_json(
-        out / f"eval-{args.eval}.json",
+        out / f"eval-{evaluation_name(args.eval)}.json",
         {
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": digest(checkpoint),
             "corpus_sha256": digest(corpus),
             "batch_limit": args.eval_batches,
+            **({"forecast_protocol": FORECAST_PROTOCOL} if forecast else {}),
             "sampling": {
                 key: getattr(args, key) for key in ("batch", "context", "width")
             },
@@ -404,15 +444,25 @@ def evaluate(args, root, out, device):
     )
 
 
+def evaluation_name(selection):
+    return selection if selection == "synthetic" else f"{selection}-{FORECAST_PROTOCOL}"
+
+
 def summarize(root, args):
     base = root / "runs" / args.run / args.suite
-    paths = sorted(base.glob(f"*/seed-*/eval-{args.eval}.json"))
+    name = evaluation_name(args.eval)
+    paths = sorted(base.glob(f"*/seed-*/eval-{name}.json"))
     if not paths:
         raise FileNotFoundError(f"No evaluations for {args.eval} under {base}")
     details = {}
     protocols = set()
     for path in paths:
         result = read_json(path)
+        if (
+            args.eval != "synthetic"
+            and result.get("forecast_protocol") != FORECAST_PROTOCOL
+        ):
+            raise ValueError(f"{path} does not use the {FORECAST_PROTOCOL} policy")
         protocols.add(
             (
                 result["corpus_sha256"],
@@ -446,7 +496,7 @@ def summarize(root, args):
     ]
     if missing:
         raise ValueError(f"Missing evaluation files for {missing}")
-    target = base / f"summary-{args.eval}.csv"
+    target = base / f"summary-{name}.csv"
     with target.open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(
@@ -471,7 +521,7 @@ def summarize(root, args):
         }
     else:
         contrasts = {"direct_minus_family": (-1, 1)}
-    with (base / f"contrasts-{args.eval}.csv").open("w", newline="") as stream:
+    with (base / f"contrasts-{name}.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(
             ["seed", "split", "metric", "contrast", "score_delta", "loss_delta"]

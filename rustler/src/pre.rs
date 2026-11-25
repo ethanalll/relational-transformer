@@ -46,7 +46,7 @@ struct Table {
     col_stats: Vec<ColStat>,
     pcol_name: Option<String>,
     fcol_name_to_ptable_name: HashMap<String, String>,
-    tcol_name: Option<String>,
+    timestamps: Option<Int64Chunked>,
     node_idx_offset: i32,
 }
 
@@ -60,6 +60,23 @@ pub struct Cli {
     input_dir: Option<String>,
     #[arg(long)]
     output_dir: Option<String>,
+    /// Fit feature normalization using rows known at this Unix timestamp.
+    #[arg(long)]
+    stats_cutoff: Option<i32>,
+}
+
+fn unix_timestamp(table: &Table, row: usize, forecast: bool) -> Option<i32> {
+    table.timestamps.as_ref().and_then(|timestamps| {
+        match timestamps.get(row) {
+            Some(ns) => Some(
+                ns.div_euclid(1_000_000_000)
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            ),
+            // A row without a time in a dated table is not known at the cutoff.
+            None if forecast => Some(i32::MAX),
+            None => None,
+        }
+    })
 }
 
 fn cast_col_to_bool(df: DataFrame, col_name: &str) -> Result<DataFrame, PolarsError> {
@@ -352,6 +369,17 @@ pub fn main(cli: Cli) {
             }
         }
 
+        let timestamps = tcol_name.as_ref().map(|name| {
+            df.column(name)
+                .unwrap()
+                .cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))
+                .unwrap()
+                .cast(&DataType::Int64)
+                .unwrap()
+                .i64()
+                .unwrap()
+                .clone()
+        });
         let num_rows = df.height() as i32;
         let num_cells = num_rows * df.width() as i32;
         table_map.insert(
@@ -362,7 +390,7 @@ pub fn main(cli: Cli) {
                 col_stats: Vec::new(),
                 pcol_name,
                 fcol_name_to_ptable_name,
-                tcol_name,
+                timestamps,
                 node_idx_offset: num_rows_sum,
             },
         );
@@ -377,8 +405,19 @@ pub fn main(cli: Cli) {
     let mut dt_sum: f64 = 0.0;
     let mut dt_sum_sq: f64 = 0.0;
 
-    for table in table_map.values_mut() {
+    for ((_, table_type), table) in &mut table_map {
+        if cli.stats_cutoff.is_some() && matches!(table_type, TableType::Val | TableType::Test) {
+            // These splits inherit their task's train-only feature statistics below.
+            continue;
+        }
+        let known_rows = cli.stats_cutoff.zip(table.timestamps.as_ref()).map(|(cutoff, times)| {
+            times.lt_eq(i64::from(cutoff) * 1_000_000_000)
+        });
         for col in table.df.iter() {
+            let col = known_rows.as_ref().map_or_else(
+                || col.clone(),
+                |known| col.filter(known).unwrap(),
+            );
             let col = col.rechunk();
             match col.dtype() {
                 DataType::Boolean => {
@@ -579,18 +618,7 @@ pub fn main(cli: Cli) {
 
                     node.f2p_nbr_idxs.push(pnode_idx);
 
-                    let timestamp = if let Some(c) = &table.tcol_name {
-                        table
-                            .df
-                            .column(c)
-                            .unwrap()
-                            .datetime()
-                            .unwrap()
-                            .get(r)
-                            .map(|v| (v / 1_000_000_000) as i32)
-                    } else {
-                        None
-                    };
+                    let timestamp = unix_timestamp(table, r, cli.stats_cutoff.is_some());
                     node.timestamp = timestamp;
 
                     let l = text_to_idx.len() as i32;
@@ -599,19 +627,7 @@ pub fn main(cli: Cli) {
                         .or_insert_with(|| l);
 
                     let ptable = &table_map[&(ptable_name.to_string(), TableType::Db)];
-                    let ptimestamp = if ptable.tcol_name.is_some() {
-                        let tcol_name = ptable.tcol_name.as_ref().unwrap();
-                        ptable
-                            .df
-                            .column(tcol_name)
-                            .unwrap()
-                            .datetime()
-                            .unwrap()
-                            .get(val as usize)
-                            .map(|v| (v / 1_000_000_000) as i32)
-                    } else {
-                        None
-                    };
+                    let ptimestamp = unix_timestamp(ptable, val as usize, cli.stats_cutoff.is_some());
 
                     let f2p_edge = Edge {
                         node_idx: pnode_idx,
@@ -640,11 +656,7 @@ pub fn main(cli: Cli) {
                 node.is_task_node = table_type != &TableType::Db;
                 node.node_idx = node_idx;
                 node.table_name_idx = table_name_idx;
-                node.timestamp = table.tcol_name.as_ref().and_then(|c| {
-                    let col = table.df.column(c).unwrap();
-                    let ns = col.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None)).unwrap();
-                    ns.datetime().unwrap().get(r).map(|v| (v / 1_000_000_000) as i32)
-                });
+                node.timestamp = unix_timestamp(table, r, cli.stats_cutoff.is_some());
 
                 let val = match val {
                     AnyValue::Boolean(val) => AnyValue::Boolean(val),

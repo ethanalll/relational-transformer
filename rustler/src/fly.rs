@@ -233,6 +233,28 @@ struct Item {
     node_idx: i32,
 }
 
+#[derive(Clone, Copy)]
+struct ForecastPolicy {
+    allow_validation_labels: bool,
+    horizon_seconds: i64,
+    split_cutoff: i32,
+}
+
+impl ForecastPolicy {
+    fn allows(self, table: &ArchivedTableType, timestamp: Option<i32>, cutoff: i32) -> bool {
+        match table {
+            ArchivedTableType::Db => timestamp.is_none_or(|time| time <= cutoff),
+            ArchivedTableType::Train | ArchivedTableType::Val => {
+                (table == &ArchivedTableType::Train || self.allow_validation_labels)
+                    && timestamp.is_some_and(|time| {
+                        i64::from(time) + self.horizon_seconds <= i64::from(cutoff)
+                    })
+            }
+            ArchivedTableType::Test => false,
+        }
+    }
+}
+
 #[pyclass]
 pub struct Sampler {
     batch_size: usize,
@@ -248,6 +270,7 @@ pub struct Sampler {
     seed: u64,
     target_columns: Vec<i32>,
     columns_to_drop: Vec<Vec<i32>>,
+    forecast_policies: Vec<Option<ForecastPolicy>>,
     dataset_tuples: Vec<(String, i32, i32)>, // (db_name, node_idx_offset, num_nodes) for each dataset
 }
 
@@ -255,6 +278,7 @@ pub struct Sampler {
 impl Sampler {
     #[new]
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (dataset_tuples, batch_size, rank, world_size, ctx_len, max_bfs_width, embedding_model, d_text, seed, target_columns, columns_to_drop, pre_dir, forecast_policies=None))]
     fn new(
         dataset_tuples: Vec<(String, i32, i32)>,
         batch_size: usize,
@@ -268,7 +292,20 @@ impl Sampler {
         target_columns: Vec<i32>,
         columns_to_drop: Vec<Vec<i32>>,
         pre_dir: String,
+        forecast_policies: Option<Vec<Option<(bool, i64, i32)>>>,
     ) -> Self {
+        let forecast_policies = forecast_policies.unwrap_or_else(|| vec![None; dataset_tuples.len()]);
+        assert_eq!(forecast_policies.len(), dataset_tuples.len());
+        let forecast_policies = forecast_policies
+            .into_iter()
+            .map(|entry| {
+                entry.map(|(allow_validation_labels, horizon_seconds, split_cutoff)| ForecastPolicy {
+                    allow_validation_labels,
+                    horizon_seconds,
+                    split_cutoff,
+                })
+            })
+            .collect();
         let mut datasets = Vec::new();
         let mut dataset_by_task = Vec::with_capacity(dataset_tuples.len());
         let mut indices = HashMap::new();
@@ -324,6 +361,7 @@ impl Sampler {
             seed,
             target_columns,
             columns_to_drop,
+            forecast_policies,
             dataset_tuples,
         };
 
@@ -423,6 +461,7 @@ impl Sampler {
             &mut rng,
             self.ctx_len,
             &mut visited_at_depth,
+            self.forecast_policies[item.dataset_idx as usize],
         );
 
         for bfs_node_idx in bfs_nodes {
@@ -538,10 +577,17 @@ impl Sampler {
         rng: &mut StdRng,
         max_cells: usize,
         visited_at_depth: &mut HashMap<i32, usize>,
+        forecast: Option<ForecastPolicy>,
     ) -> Vec<i32> {
         let mut result = Vec::new();
 
         let start_node = get_node(dataset, start_idx);
+        let start_time = start_node.timestamp.as_ref().map(|time| (*time).into());
+        let cutoff = forecast.map(|rule| {
+            let start = start_time.expect("RelBench forecasting queries need a timestamp");
+            rule.split_cutoff.min(start)
+        });
+        let forecast = forecast.zip(cutoff);
         let mut num_cells = 0;
 
         // Two frontier data structures:
@@ -595,6 +641,11 @@ impl Sampler {
 
             // Add f2p edges to f2p frontier
             for edge in node.f2p_edges.iter() {
+                if let Some((rule, cutoff)) = forecast
+                    && !rule.allows(&edge.table_type, edge.timestamp.as_ref().map(|t| (*t).into()), cutoff)
+                {
+                    continue;
+                }
                 f2p_ftr.push((depth + 1, edge.node_idx.into()));
             }
 
@@ -607,7 +658,9 @@ impl Sampler {
             // The edges are sorted by timestamp, so we can binary search to find valid ones
             let valid_edges = p2f_edges.as_slice().partition_point(|edge| {
                 edge.timestamp.is_none()
-                    || (start_node.timestamp.is_some() && edge.timestamp <= start_node.timestamp)
+                    || edge.timestamp.as_ref().is_some_and(|time| {
+                        cutoff.or(start_time).is_some_and(|limit| i32::from(*time) <= limit)
+                    })
             });
 
             // Filter valid edges by table constraints
@@ -617,6 +670,12 @@ impl Sampler {
                 // include edges to task table only if seed node belongs to the task table
                 if edge.table_name_idx != start_node.table_name_idx
                     && edge.table_type != ArchivedTableType::Db
+                {
+                    continue;
+                }
+
+                if let Some((rule, cutoff)) = forecast
+                    && !rule.allows(&edge.table_type, edge.timestamp.as_ref().map(|t| (*t).into()), cutoff)
                 {
                     continue;
                 }
@@ -699,6 +758,7 @@ pub fn main(cli: Cli) {
         vec![-1; 1],                // target_columns
         vec![Vec::<i32>::new()],    // columns_to_drop
         format!("{}/scratch/pre", var("HOME").unwrap()),
+        None,
     );
     println!("Sampler loaded in {:?}", tic.elapsed());
 

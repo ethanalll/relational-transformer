@@ -8,6 +8,13 @@ import torch
 from rustler import Sampler
 from torch.utils.data import Dataset
 
+from .experiment_data import forecast_policy
+from .tasks import forecast_clf_tasks, forecast_reg_tasks
+
+FORECAST_TASKS = {
+    (db, table) for db, table, *_ in forecast_clf_tasks + forecast_reg_tasks
+}
+
 
 @cache
 def _load_column_index(db_name: str, pre_dir: Path) -> dict:
@@ -48,13 +55,21 @@ class RelationalDataset(Dataset):
         d_text,
         seed,
         pre_dir=None,
+        forecast_policies=None,
     ):
         pre_dir = Path(pre_dir or Path.home() / "scratch/pre").expanduser().resolve()
         dataset_tuples = []
         target_column_indices = []
         drop_column_indices = []
+        policies = []
 
         for db_name, table_name, target_column, split, columns_to_drop in tasks:
+            if forecast_policies is not None:
+                policies.append(tuple(forecast_policies[db_name][table_name][split]))
+            elif split in ("val", "test") and (db_name, table_name) in FORECAST_TASKS:
+                policies.append(forecast_policy(db_name, table_name, split))
+            else:
+                policies.append(None)
             if split == "train":
                 split = "Train"
             elif split == "val":
@@ -98,6 +113,7 @@ class RelationalDataset(Dataset):
             seed=seed,
             target_columns=target_column_indices,
             columns_to_drop=drop_column_indices,
+            **({"forecast_policies": policies} if any(policies) else {}),
         )
 
         self.seq_len = seq_len

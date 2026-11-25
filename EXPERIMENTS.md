@@ -21,7 +21,7 @@ Set `DATA` to the same absolute path in both repositories. Every stage has a fix
 | `synthetic/pre/holdout/val/reference/` | Common evaluation corpus from disjoint synthesis seeds |
 | `relbench/raw/<db>/db/` | Raw RelBench database Parquet |
 | `relbench/raw/<db>/tasks/<task>/` | Official `train.parquet`, `val.parquet`, and `test.parquet` |
-| `relbench/pre/<db>/` | RelBench native caches and embeddings, shared by every run |
+| `relbench/pre/forecast-v1/<db>/` | RelBench native caches and embeddings, shared by every run |
 | `runs/<run>/<suite>/<arm>/seed-<seed>/` | Config, checkpoint, resume state, token totals, and evaluation JSON |
 
 ## One-time setup
@@ -68,6 +68,12 @@ make preprocess-holdout
 
 If your cluster already has the Parquet files, place or link them at the documented `relbench/raw` paths and start with preprocessing. Preprocessing defaults to `cuda:0` for MiniLM. Use `EMBED_DEVICE=cpu` on a CPU allocation or `MODEL_PATH=/shared/models/all-MiniLM-L12-v2` with a local copy of the model. Each ready database cache can be reused on retry. `make preprocess-arm SUITE=factorial ARM=local-original` prepares a single arm for parallel cluster jobs.
 
+RelBench forecasting uses the official validation and test cutoffs. The sampler traverses only rows available at the earlier of the split cutoff and the query time. Validation uses completed training labels as historical context. Test can also use completed validation labels. The query's own outcome goes to the scorer, and peer rows from the evaluated split are excluded from context. Normalization for timed database features uses rows through the validation cutoff.
+
+The `forecast-v1` cache and result names allow archived evaluations to coexist with corrected ones. Rebuild the native extension and run `make preprocess-relbench` before scoring an existing checkpoint with this policy.
+
+After `make native`, run `.venv/bin/python -m unittest discover -s test` to exercise the forecast policy on a local fixture. Set `RT_TEST_NATIVE_BIN` if the native binary lives outside the default build path.
+
 ## 3. Train, evaluate, and summarize in RT
 
 Run each arm in its own GPU allocation using the same seed. Repeat the complete suite for each additional model seed. Example:
@@ -76,6 +82,14 @@ Run each arm in its own GPU allocation using the same seed. Repeat the complete 
 make train SUITE=factorial ARM=local-original SEED=0 RUN=pilot STEPS=1908
 make evaluate SUITE=factorial ARM=local-original SEED=0 RUN=pilot EVAL=amazon
 make evaluate SUITE=factorial ARM=local-original SEED=0 RUN=pilot EVAL=synthetic
+```
+
+Evaluate PluRel's released Table 1 synthetic-only checkpoint with the same settings as the ablation checkpoints. The run name keeps its results separate from the ablation summaries.
+
+```sh
+make evaluate SUITE=factorial ARM=local-original RUN=plurel-paper EVAL=amazon \
+  CHECKPOINT=/path/to/synthetic-pretrain_rdb_1024_size_4b.pt \
+  BATCH=128 CONTEXT=1024 WIDTH=128
 ```
 
 ### GPU controls
@@ -109,4 +123,4 @@ make summarize SUITE=factorial RUN=pilot EVAL=synthetic
 make summarize SUITE=sampler RUN=pilot EVAL=amazon
 ```
 
-The summary and paired contrasts CSVs are written to `runs/<run>/<suite>/`. The factorial summary reports the two main effects and their interaction per seed. The sampler contrast reports direct minus family. Each evaluation JSON also records per-task validation/test metrics and masked loss.
+The summary and paired contrasts CSVs are written to `runs/<run>/<suite>/`. RelBench result, summary, and contrast filenames end in `-forecast-v1` before the extension. The factorial summary reports the two main effects and their interaction per seed. The sampler contrast reports direct minus family. Each evaluation JSON also records per-task validation/test metrics and masked loss.
