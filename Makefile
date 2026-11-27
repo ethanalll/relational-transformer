@@ -20,6 +20,10 @@ BATCH ?= 128
 CONTEXT ?= 1024
 WIDTH ?= 128
 CHECKPOINT_EVERY ?= 250
+SAVE_EVERY ?= 2000
+SAVE_STEPS ?=
+SAVE_DIR ?=
+STEP ?=
 NATIVE_BIN ?= $(CURDIR)/rustler/target/release/rustler
 
 experiment = $(PYTHON) -m rt.experiment
@@ -28,6 +32,7 @@ train_command = $(if $(filter 1,$(GPUS)),$(experiment),$(PYTHON) -m torch.distri
 data_command = $(PYTHON) -m rt.experiment_data
 run_args = --data-root "$(DATA)" --corpus "$(CORPUS)" --run "$(RUN)" --seed "$(SEED)" --data-seed "$(DATA_SEED)"
 batch_args = --device "$(DEVICE)" --batch "$(BATCH)" --context "$(CONTEXT)" --width "$(WIDTH)"
+save_args = --save-every "$(SAVE_EVERY)" $(if $(strip $(SAVE_STEPS)),--save-steps "$(SAVE_STEPS)") $(if $(strip $(SAVE_DIR)),--save-dir "$(SAVE_DIR)")
 prepare_args = --data-root "$(DATA)" --device "$(EMBED_DEVICE)" --native-bin "$(NATIVE_BIN)" $(if $(MODEL_PATH),--model-path "$(MODEL_PATH)")
 eval_args = --eval "$(EVAL)" --holdout "$(HOLDOUT)" $(if $(EVAL_BATCHES),--eval-batches "$(EVAL_BATCHES)")
 
@@ -38,8 +43,8 @@ help:
 	@echo '  make download-relbench EVAL=amazon'
 	@echo '  make preprocess-relbench EVAL=amazon'
 	@echo '  make preprocess-synthetic CORPUS=global-quantile'
-	@echo '  make train CORPUS=global-quantile SEED=0 RUN=pilot GPUS=4 BATCH=128'
-	@echo '  make evaluate CORPUS=global-quantile SEED=0 RUN=pilot EVAL=amazon'
+	@echo '  make train CORPUS=global-quantile SEED=0 RUN=pilot GPUS=4 BATCH=128 [SAVE_EVERY=2000]'
+	@echo '  make evaluate CORPUS=global-quantile SEED=0 RUN=pilot EVAL=amazon [STEP=2000]'
 	@echo '  make evaluate CORPUS=global-quantile SEED=0 RUN=pilot EVAL=synthetic HOLDOUT=holdout-val'
 	@echo '  make summarize RUN=pilot EVAL=amazon [CORPORA=local-orig,global-quant]'
 
@@ -61,10 +66,10 @@ preprocess-synthetic:
 	$(gpu_env) $(data_command) preprocess $(prepare_args) --source synthetic --corpus "$(CORPUS)"
 
 train:
-	$(gpu_env) $(train_command) train $(run_args) $(batch_args) --steps "$(STEPS)" --checkpoint-every "$(CHECKPOINT_EVERY)" $(if $(filter 1,$(RESUME)),--resume) $(if $(filter 1,$(COMPILE)),--compile)
+	$(gpu_env) $(train_command) train $(run_args) $(batch_args) --steps "$(STEPS)" --checkpoint-every "$(CHECKPOINT_EVERY)" $(save_args) $(if $(filter 1,$(RESUME)),--resume) $(if $(filter 1,$(COMPILE)),--compile)
 
 evaluate:
-	$(gpu_env) $(experiment) evaluate $(run_args) $(batch_args) $(eval_args) $(if $(CHECKPOINT),--checkpoint "$(CHECKPOINT)")
+	$(gpu_env) $(experiment) evaluate $(run_args) $(batch_args) $(eval_args) $(if $(strip $(SAVE_DIR)),--save-dir "$(SAVE_DIR)") $(if $(strip $(STEP)),--step "$(STEP)") $(if $(CHECKPOINT),--checkpoint "$(CHECKPOINT)")
 
 summarize:
 	$(experiment) summarize $(run_args) $(eval_args) $(if $(CORPORA),--corpora "$(CORPORA)")

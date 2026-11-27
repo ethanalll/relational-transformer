@@ -66,6 +66,10 @@ All RelBench preprocessing, sampling, and scoring follow `FORECAST_PROTOCOL = "f
   - Under Slurm: launch one task (`--ntasks=1 --gres=gpu:<N>`) and leave `GPU_IDS` unset.
   - On standalone machines: set `GPU_IDS=0,2` (maps to `CUDA_VISIBLE_DEVICES`); do not pass non-zero `DEVICE` indices when `GPUS > 1`.
   - DDP scales each rank's loss by `valid * (world_size / global_valid)` so rank-averaged gradients match exact global averaging over non-empty contexts.
+- **Step checkpoints (`SAVE_EVERY`, `SAVE_STEPS`, `SAVE_DIR`, `STEP`)**:
+  - Separate from rolling `resume.pt` (`CHECKPOINT_EVERY=250`), rank 0 atomically saves persistent weights-only `state_dict` files named `step-<NNNNNN>.pt` every `SAVE_EVERY` steps (default `2000`, `0` disables) and at any steps in `SAVE_STEPS` (comma-separated) into `checkpoints/` (or `SAVE_DIR`), updating `checkpoints/index.json` (preserving prior entries across `RESUME=1`).
+  - `SAVE_EVERY`, `SAVE_STEPS`, and `SAVE_DIR` are intentionally excluded from `resume.pt`'s strict `config` hash check so snapshot cadence can be changed on resume.
+  - `make evaluate ... STEP=<N>` evaluates `<save_dir>/step-<N:06d>.pt` and writes `eval-<eval>-step-<N:06d>.json` (keeping final `eval-<eval>.json` untouched; mutually exclusive with `CHECKPOINT=`).
 - **Exact resume (`RESUME=1`)**:
   - Acquires an exclusive flock on `.seed-<seed>.lock`.
   - `resume.pt` stores `config` (including `steps`, `source_sha256` of `rt/*.py` + `rustler/Cargo.lock`, `train_corpus_sha256`, git `revision`, hyperparams), `model`, `optimizer`, `scheduler`, `step`, `epoch`, `cursor`, `tokens`, and `slots`.

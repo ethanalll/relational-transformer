@@ -95,10 +95,62 @@ def run_dir(root, corpus, seed, run):
     return root / "runs" / run / corpus / f"seed-{seed}"
 
 
+def checkpoint_filename(step):
+    return f"step-{step:06d}.pt"
+
+
+def checkpoint_dir(out, save_dir):
+    return save_dir.expanduser().resolve() if save_dir is not None else out / "checkpoints"
+
+
+def parse_save_steps(raw):
+    if not raw or not raw.strip():
+        return set()
+    steps = set()
+    for token in raw.split(","):
+        part = token.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(f"Invalid step in --save-steps: {part!r}") from exc
+        if value < 1:
+            raise ValueError(f"Steps in --save-steps must be positive, got {value}")
+        steps.add(value)
+    return steps
+
+
+def should_save_checkpoint(step, save_every, save_steps):
+    return (save_every > 0 and step % save_every == 0) or step in save_steps
+
+
 def save_state(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
+
+
+def save_step_checkpoint(ckpt_dir, step, model, *, loss, tokens, slots):
+    path = ckpt_dir / checkpoint_filename(step)
+    save_state(path, model.state_dict())
+    index_path = ckpt_dir / "index.json"
+    entries = {}
+    if index_path.is_file():
+        for entry in read_json(index_path):
+            entries[int(entry["step"])] = entry
+    entries[step] = {
+        "step": step,
+        "file": path.name,
+        "loss": float(loss),
+        "tokens": int(tokens),
+        "slots": int(slots),
+        "sha256": digest(path),
+    }
+    write_json(index_path, [entries[key] for key in sorted(entries)])
+    print(f"saved checkpoint {path}", flush=True)
+    return path
 
 
 def train(args, root, out, device, rank, world_size):
@@ -190,6 +242,8 @@ def train(args, root, out, device, rank, world_size):
             f"batch per worker {layout['batch_per_worker']}",
             flush=True,
         )
+    save_steps = parse_save_steps(args.save_steps)
+    ckpt_dir = checkpoint_dir(out, args.save_dir)
     forward = model
     if world_size > 1:
         forward = DistributedDataParallel(
@@ -230,10 +284,20 @@ def train(args, root, out, device, rank, world_size):
         step, cursor = step + 1, cursor + 1
         tokens += int(batch_tokens)
         slots += batch["is_padding"].numel() * world_size
+        mean_loss = loss_sum / global_valid
         if primary and (step == 1 or step % 50 == 0 or step == args.steps):
             print(
-                f"step {step}/{args.steps} loss={loss_sum / global_valid:.5f} tokens={tokens} slots={slots}",
+                f"step {step}/{args.steps} loss={mean_loss:.5f} tokens={tokens} slots={slots}",
                 flush=True,
+            )
+        if primary and should_save_checkpoint(step, args.save_every, save_steps):
+            save_step_checkpoint(
+                ckpt_dir,
+                step,
+                model,
+                loss=mean_loss,
+                tokens=tokens,
+                slots=slots,
             )
         if primary and (step % args.checkpoint_every == 0 or step == args.steps):
             save_state(
@@ -398,7 +462,14 @@ def evaluate(args, root, out, device):
                 f"Missing {corpus}. Run make preprocess-relbench for this DATA and EVAL."
             )
     manifest = read_json(corpus)
-    checkpoint = args.checkpoint or out / "model.pt"
+    if args.step is not None:
+        checkpoint = checkpoint_dir(out, args.save_dir) / checkpoint_filename(args.step)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Missing saved checkpoint {checkpoint}")
+        eval_path = out / f"eval-{evaluation_name(args.eval)}-step-{args.step:06d}.json"
+    else:
+        checkpoint = args.checkpoint or out / "model.pt"
+        eval_path = out / f"eval-{evaluation_name(args.eval)}.json"
     model = build_model(device).eval()
     load_weights(model, torch.load(checkpoint, weights_only=True, map_location="cpu"))
     records = []
@@ -420,10 +491,11 @@ def evaluate(args, root, out, device):
                 flush=True,
             )
     write_json(
-        out / f"eval-{evaluation_name(args.eval)}.json",
+        eval_path,
         {
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": digest(checkpoint),
+            **({"step": args.step} if args.step is not None else {}),
             "corpus_sha256": digest(corpus),
             "batch_limit": args.eval_batches,
             **({"holdout": args.holdout} if not forecast else {}),
@@ -537,6 +609,10 @@ def main():
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--checkpoint-every", type=int, default=250)
+    parser.add_argument("--save-every", type=int, default=2000)
+    parser.add_argument("--save-steps", default="")
+    parser.add_argument("--save-dir", type=Path)
+    parser.add_argument("--step", type=int)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -548,6 +624,17 @@ def main():
     root = args.data_root.expanduser().resolve()
     if min(args.steps, args.batch, args.context, args.width, args.checkpoint_every) < 1:
         parser.error("Training and sampling sizes must be positive")
+    if args.save_every < 0:
+        parser.error("--save-every must be nonnegative (0 disables periodic step saves)")
+    try:
+        parse_save_steps(args.save_steps)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.step is not None:
+        if args.step < 1:
+            parser.error("--step must be positive")
+        if args.checkpoint is not None:
+            parser.error("Specify either --step or --checkpoint, not both")
     if args.eval_batches is not None and args.eval_batches < 1:
         parser.error("Evaluation batch limit must be positive")
     if not 0 <= args.data_seed < 2**32 or args.seed < 0:

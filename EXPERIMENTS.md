@@ -16,7 +16,7 @@ Set `DATA` to the same absolute path in both repositories. Every stage has a fix
 | `relbench/raw/<db>/db/` | Raw RelBench database Parquet |
 | `relbench/raw/<db>/tasks/<task>/` | Official `train.parquet`, `val.parquet`, and `test.parquet` |
 | `relbench/pre/forecast-v1/<db>/` | RelBench native caches and embeddings, shared by every run |
-| `runs/<run>/<corpus>/seed-<seed>/` | Config, checkpoint, resume state, token totals, and evaluation JSON |
+| `runs/<run>/<corpus>/seed-<seed>/` | Config, final `model.pt`, `checkpoints/step-NNNNNN.pt`, `resume.pt`, token totals, and evaluation JSON |
 
 ## One-time setup
 
@@ -105,9 +105,22 @@ make train CORPUS=global-quant RUN=pilot GPUS=2 GPU_IDS=0,2 BATCH=128 STEPS=1908
 
 In Slurm, leave `GPU_IDS` unset to use the scheduler's visible GPUs, and add the account and partition flags required by your cluster. On a standalone machine, `GPU_IDS` sets `CUDA_VISIBLE_DEVICES` and the workers use the listed devices in order. For single-GPU runs and evaluation, `DEVICE=cuda:0` selects the first visible GPU. `EMBED_DEVICE` controls preprocessing.
 
-Resume with the same run identifiers, global batch size, `STEPS`, and training settings plus `RESUME=1`. Checkpoints preserve model, optimizer, scheduler, and the position in the global sampler. You can change `GPUS` on resume if the global batch divides evenly. GPU count changes can affect floating-point rounding. Run metadata records the latest worker count and batch per worker.
+Resume with the same run identifiers, global batch size, `STEPS`, and training settings plus `RESUME=1`. `resume.pt` is updated every `CHECKPOINT_EVERY` steps (default `250`) and preserves model, optimizer, scheduler, and the position in the global sampler. You can change `GPUS` on resume if the global batch divides evenly. GPU count changes can affect floating-point rounding. Run metadata records the latest worker count and batch per worker.
 
-Give smoke runs a distinct name such as `RUN=smoke STEPS=10 BATCH=8 CONTEXT=128 CHECKPOINT_EVERY=2`. Evaluation uses one GPU. Pass the same `CONTEXT` and `WIDTH` as training, and set `EVAL_BATCHES=2` for a short check or leave it unset for the full splits.
+### Checkpoint saving
+
+Training also saves persistent weights-only step checkpoints every `SAVE_EVERY` steps (default `2000`, set `SAVE_EVERY=0` to disable) to `runs/<run>/<corpus>/seed-<seed>/checkpoints/step-<NNNNNN>.pt` along with `checkpoints/index.json` (step, loss, tokens, slots, SHA-256). Use `SAVE_STEPS=500,1000,1908` to save additional explicit steps, or `SAVE_DIR=/path/to/dir` to write step checkpoints elsewhere. Changing `SAVE_EVERY`, `SAVE_STEPS`, or `SAVE_DIR` does not invalidate `RESUME=1`.
+
+To evaluate a saved step checkpoint without overwriting the final `model.pt` evaluation JSON, pass `STEP`:
+
+```sh
+make train CORPUS=global-quant SEED=0 RUN=pilot STEPS=7629 SAVE_EVERY=2000
+make evaluate CORPUS=global-quant SEED=0 RUN=pilot EVAL=amazon STEP=2000
+```
+
+This loads `checkpoints/step-002000.pt` (or `SAVE_DIR/step-002000.pt`) and writes `eval-<eval>-step-002000.json`.
+
+Give smoke runs a distinct name such as `RUN=smoke STEPS=10 BATCH=8 CONTEXT=128 CHECKPOINT_EVERY=2 SAVE_EVERY=5`. Evaluation uses one GPU. Pass the same `CONTEXT` and `WIDTH` as training, and set `EVAL_BATCHES=2` for a short check or leave it unset for the full splits.
 
 Once all corpora have been evaluated for a seed:
 
