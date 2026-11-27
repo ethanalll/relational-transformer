@@ -63,6 +63,10 @@ pub struct Cli {
     /// Fit feature normalization using rows known at this Unix timestamp.
     #[arg(long)]
     stats_cutoff: Option<i32>,
+    /// Per-task forecast horizon in seconds (table=seconds) so Train stats exclude
+    /// labels whose horizon extends past --stats-cutoff.
+    #[arg(long = "task-horizon")]
+    task_horizons: Vec<String>,
 }
 
 fn unix_timestamp(table: &Table, row: usize, forecast: bool) -> Option<i32> {
@@ -293,7 +297,9 @@ pub fn main(cli: Cli) {
                 || table_name == "user-attendance"
             {
                 df = df.drop("index").unwrap();
-                df = cast_col_to_bool(df, "target").unwrap();
+                if table_name != "user-attendance" {
+                    df = cast_col_to_bool(df, "target").unwrap();
+                }
             }
         }
 
@@ -401,17 +407,36 @@ pub fn main(cli: Cli) {
 
     println!("computing column stats...");
     let tic = Instant::now();
+    let task_horizons: HashMap<String, i64> = cli
+        .task_horizons
+        .iter()
+        .map(|spec| {
+            let (name, secs) = spec
+                .split_once('=')
+                .unwrap_or_else(|| panic!("Invalid --task-horizon spec (expected table=seconds): {spec}"));
+            let horizon: i64 = secs
+                .parse()
+                .unwrap_or_else(|_| panic!("Invalid horizon seconds in --task-horizon: {spec}"));
+            (name.to_string(), horizon)
+        })
+        .collect();
     let mut dt_cnt: usize = 0;
-    let mut dt_sum: f64 = 0.0;
-    let mut dt_sum_sq: f64 = 0.0;
+    let mut dt_mean: f64 = 0.0;
+    let mut dt_m2: f64 = 0.0;
 
-    for ((_, table_type), table) in &mut table_map {
+    for ((table_name, table_type), table) in &mut table_map {
         if cli.stats_cutoff.is_some() && matches!(table_type, TableType::Val | TableType::Test) {
             // These splits inherit their task's train-only feature statistics below.
             continue;
         }
         let known_rows = cli.stats_cutoff.zip(table.timestamps.as_ref()).map(|(cutoff, times)| {
-            times.lt_eq(i64::from(cutoff) * 1_000_000_000)
+            let horizon = if table_type == &TableType::Train {
+                task_horizons.get(table_name).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let limit_secs = i64::from(cutoff).saturating_sub(horizon);
+            times.lt_eq(limit_secs.saturating_mul(1_000_000_000))
         });
         for col in table.df.iter() {
             let col = known_rows.as_ref().map_or_else(
@@ -465,22 +490,35 @@ pub fn main(cli: Cli) {
                     assert!(*col.dtype() == DataType::Datetime(TimeUnit::Nanoseconds, None));
                     let col = col.cast(&DataType::Float64).unwrap().drop_nulls();
                     let col = col.filter(&col.is_not_nan().unwrap()).unwrap();
-                    dt_cnt += col.len();
-                    dt_sum += col.sum::<f64>().unwrap();
-                    dt_sum_sq += col
-                        .iter()
-                        .map(|x| {
-                            if let AnyValue::Float64(f) = x {
-                                f * f
-                            } else {
-                                panic!()
-                            }
-                        })
-                        .sum::<f64>();
-                    // let mean = col.mean().unwrap_or(0.0);
-                    // let std = col.std(1).unwrap_or(1.0);
-                    // let std = if !std.is_finite() || std == 0.0 { 1.0 } else { std };
-                    // table.col_stats.push(ColStat { mean, std });
+                    let n_b = col.len();
+                    if n_b > 0 {
+                        // Chan's parallel online variance avoids catastrophic cancellation
+                        // when combining ~1e18-scale nanosecond epoch timestamps.
+                        let mean_b = col.mean().unwrap_or(0.0);
+                        let m2_b = col
+                            .iter()
+                            .map(|x| {
+                                if let AnyValue::Float64(f) = x {
+                                    let d = f - mean_b;
+                                    d * d
+                                } else {
+                                    panic!()
+                                }
+                            })
+                            .sum::<f64>();
+                        if dt_cnt == 0 {
+                            dt_cnt = n_b;
+                            dt_mean = mean_b;
+                            dt_m2 = m2_b;
+                        } else {
+                            let delta = mean_b - dt_mean;
+                            let new_cnt = dt_cnt + n_b;
+                            dt_mean += delta * (n_b as f64 / new_cnt as f64);
+                            dt_m2 += m2_b
+                                + delta * delta * (dt_cnt as f64 * n_b as f64 / new_cnt as f64);
+                            dt_cnt = new_cnt;
+                        }
+                    }
                     table.col_stats.push(ColStat {
                         mean: 0.0,
                         std: 0.0,
@@ -494,12 +532,13 @@ pub fn main(cli: Cli) {
         }
     }
 
-    let dt_mean = if dt_cnt > 0 { dt_sum / dt_cnt as f64 } else { 0.0 };
-    let dt_std = if dt_cnt > 0 { (dt_sum_sq / dt_cnt as f64 - dt_mean * dt_mean).max(0.0).sqrt() } else { 1.0 };
+    let dt_std = if dt_cnt > 0 {
+        (dt_m2 / dt_cnt as f64).max(0.0).sqrt()
+    } else {
+        1.0
+    };
     let dt_std = if dt_std.is_finite() && dt_std > 0.0 { dt_std } else { 1.0 };
     dbg!(dt_cnt);
-    dbg!(dt_sum);
-    dbg!(dt_sum_sq);
     dbg!(dt_mean);
     dbg!(dt_std);
 

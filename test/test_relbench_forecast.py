@@ -41,7 +41,15 @@ def save(path, data, *, pk=None, fk=None, dated=False):
     ).save(path)
 
 
-def build_fixture(root, native, *, val_labels, test_labels, future_value):
+def build_fixture(
+    root,
+    native,
+    *,
+    val_labels,
+    test_labels,
+    future_value,
+    incomplete_train_label=9.0,
+):
     raw = root / "raw"
     dated = raw / "db"
     save(dated / "users.parquet", {"id": [0, 1], "amount": [1.0, 3.0]}, pk="id")
@@ -65,7 +73,7 @@ def build_fixture(root, native, *, val_labels, test_labels, future_value):
         dated=True,
     )
     for split, users, timestamps, labels in (
-        ("train", [0, 1, 0], [3, 13, 18], [2.0, 6.0, 9.0]),
+        ("train", [0, 1, 0], [3, 13, 18], [2.0, 6.0, incomplete_train_label]),
         ("val", [0, 1, 0], [20, 20, 40], val_labels),
         ("test", [0, 1, 0], [35, 35, 45], test_labels),
     ):
@@ -97,6 +105,10 @@ def build_fixture(root, native, *, val_labels, test_labels, future_value):
             str(cache),
             "--stats-cutoff",
             str(unix(20)),
+            "--task-horizon",
+            f"{TASK}={7 * DAY}",
+            "--task-horizon",
+            f"{CLASSIFICATION}={7 * DAY}",
         ],
         capture_output=True,
         text=True,
@@ -144,6 +156,15 @@ class RelBenchForecastTest(unittest.TestCase):
             test_labels=[1.0, 8.0, 13.0],
             future_value=10.0,
         )
+        cls.changed_incomplete_train = build_fixture(
+            Path(temp.name) / "incomplete-train-changed",
+            native,
+            val_labels=[3.0, 5.0, 11.0],
+            test_labels=[1.0, 8.0, 13.0],
+            future_value=10.0,
+            incomplete_train_label=9000.0,
+        )
+        cls.native = native
         cls.tables = json.loads((cls.clean / DB / "table_info.json").read_text())
 
     def rows(self, table):
@@ -297,3 +318,187 @@ class RelBenchForecastTest(unittest.TestCase):
                 self.assertGreater(validation[1], 0)
                 self.assertEqual(validation[1], test[1])
                 self.assertGreaterEqual(test[2], validation[2] + validation[1])
+
+    def test_incomplete_horizon_train_row_does_not_leak_into_normalization(self):
+        clean_batch = self.batches(self.clean, "val")[0]
+        changed_batch = self.batches(self.changed_incomplete_train, "val")[0]
+        torch.testing.assert_close(
+            clean_batch["number_values"],
+            changed_batch["number_values"],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_undated_entity_seed_reaches_dated_activity_p2f_children(self):
+        # Non-forecast synthetic-style query on undated Entity table (`users`)
+        # must still traverse p2f edges to dated child table (`review`).
+        data = dataset(
+            self.clean,
+            [[DB, "users", "amount", [], "reg"]],
+            "train",
+            CONFIG,
+            shuffle_seed=0,
+        )
+        review_rows = set(self.rows("review:Db"))
+        reached = set()
+        for index in range(len(data)):
+            batch = data[index]
+            for row in range(batch["true_batch_size"]):
+                reached.update(
+                    batch["node_idxs"][row, ~batch["is_padding"][row]].tolist()
+                )
+        self.assertTrue(review_rows <= reached)
+
+    def test_tiny_context_retains_wide_seed_target_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "raw"
+            wide = {"id": [0, 1]}
+            for i in range(8):
+                wide[f"f{i}"] = [float(i), float(i + 10)]
+            save(raw / "db" / "wide.parquet", wide, pk="id")
+            cache = root / "pre" / "wide_db"
+            subprocess.run(
+                [
+                    str(self.native),
+                    "pre",
+                    "wide_db",
+                    "--input-dir",
+                    str(raw),
+                    "--output-dir",
+                    str(cache),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            texts = json.loads((cache / "text.json").read_text())
+            (cache / f"text_emb_{MINILM}.bin").write_bytes(bytes(len(texts) * 384 * 2))
+            data = dataset(
+                cache.parent,
+                [["wide_db", "wide", "f7", [], "reg"]],
+                "train",
+                {"batch": 2, "context": 4, "width": 8},
+                shuffle_seed=0,
+            )
+            batch = data[0]
+            self.assertEqual(batch["is_targets"].sum(dim=1).tolist(), [1, 1])
+            self.assertTrue(batch["masks"][batch["is_targets"]].all())
+
+    def test_short_span_datetime_normalization_avoids_cancellation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "raw"
+            # Two timestamps 1 hour apart in 2025 (~1.74e18 ns); naive E[X^2]-E[X]^2 loses precision.
+            ts = pd.to_datetime(["2025-06-01 00:00:00", "2025-06-01 01:00:00"]).as_unit(
+                "ns"
+            )
+            save(
+                raw / "db" / "events.parquet",
+                {"id": [0, 1], "date": ts, "val": [1.0, 2.0]},
+                pk="id",
+                dated=True,
+            )
+            cache = root / "pre" / "short_dt"
+            subprocess.run(
+                [
+                    str(self.native),
+                    "pre",
+                    "short_dt",
+                    "--input-dir",
+                    str(raw),
+                    "--output-dir",
+                    str(cache),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            texts = json.loads((cache / "text.json").read_text())
+            (cache / f"text_emb_{MINILM}.bin").write_bytes(bytes(len(texts) * 384 * 2))
+            data = dataset(
+                cache.parent,
+                [["short_dt", "events", "val", [], "reg"]],
+                "train",
+                {"batch": 2, "context": 16, "width": 8},
+                shuffle_seed=0,
+            )
+            batch = data[0]
+            dt_vals = batch["datetime_values"][batch["sem_types"] == 2].float()
+            self.assertGreater(dt_vals.numel(), 0)
+            self.assertTrue(torch.isfinite(dt_vals).all())
+            # Exact population z-scores of two points are -1.0 and +1.0 (not +/-1e12).
+            self.assertAlmostEqual(dt_vals.abs().max().item(), 1.0, places=2)
+
+    def test_rel_event_user_attendance_remains_regression(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "raw"
+            save(raw / "db" / "users.parquet", {"id": [0, 1], "age": [20.0, 30.0]}, pk="id")
+            for split, vals in (("train", [1.5, 4.5]), ("val", [2.0, 5.0]), ("test", [3.0, 6.0])):
+                save(
+                    raw / "tasks" / "user-attendance" / f"{split}.parquet",
+                    {"index": [0, 1], "user": [0, 1], "date": dates([1, 2]), "target": vals},
+                    fk={"user": "users"},
+                    dated=True,
+                )
+            cache = root / "pre" / "rel-event"
+            subprocess.run(
+                [
+                    str(self.native),
+                    "pre",
+                    "rel-event",
+                    "--input-dir",
+                    str(raw),
+                    "--output-dir",
+                    str(cache),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            texts = json.loads((cache / "text.json").read_text())
+            (cache / f"text_emb_{MINILM}.bin").write_bytes(bytes(len(texts) * 384 * 2))
+            data = dataset(
+                cache.parent,
+                [["rel-event", "user-attendance", "target", [], "reg"]],
+                "val",
+                {"batch": 2, "context": 16, "width": 8},
+                shuffle_seed=0,
+                forecast_policies={
+                    "rel-event": {
+                        "user-attendance": {
+                            "val": (False, DAY, unix(10)),
+                            "test": (True, DAY, unix(20)),
+                        }
+                    }
+                },
+            )
+            batch = data[0]
+            # SemType::Number == 0 (previously broken by casting target to Boolean == 3).
+            self.assertTrue((batch["sem_types"][batch["is_targets"]] == 0).all())
+
+    def test_chunked_text_embeddings_match_single_shot(self):
+        from rt.experiment_data import write_text_embeddings
+
+        # Encode deterministic values tied to text string so chunking order is verified.
+        class TextKeyedModel:
+            def encode(self, texts, batch_size, convert_to_tensor, show_progress_bar):
+                return torch.stack(
+                    [torch.full((384,), float(int(t)), dtype=torch.float32) for t in texts],
+                    dim=0,
+                )
+
+        texts = [str(i) for i in range(11)]
+        model = TextKeyedModel()
+        with tempfile.TemporaryDirectory() as tmp:
+            single = Path(tmp) / "single.bin"
+            chunked = Path(tmp) / "chunked.bin"
+            write_text_embeddings(
+                model, texts, single, device_type="cpu", name="t", chunk_size=100, batch_size=16
+            )
+            write_text_embeddings(
+                model, texts, chunked, device_type="cpu", name="t", chunk_size=3, batch_size=2
+            )
+            self.assertEqual(single.read_bytes(), chunked.read_bytes())
+            self.assertEqual(len(chunked.read_bytes()), len(texts) * 384 * 2)

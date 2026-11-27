@@ -97,6 +97,51 @@ def source_signature(path):
     ]
 
 
+def write_text_embeddings(
+    model,
+    texts,
+    path,
+    *,
+    device_type,
+    name,
+    chunk_size=65_536,
+    batch_size=None,
+):
+    """Stream MiniLM embeddings to disk in bounded GPU/CPU memory chunks."""
+    import torch
+
+    if batch_size is None:
+        batch_size = 2048 if device_type == "cuda" else 256
+    written = 0
+    with path.open("wb") as stream:
+        for start in range(0, len(texts), chunk_size):
+            chunk = texts[start : start + chunk_size]
+            vectors = model.encode(
+                chunk,
+                batch_size=batch_size,
+                convert_to_tensor=True,
+                show_progress_bar=False,
+            )
+            if (
+                vectors.shape != (len(chunk), 384)
+                or not torch.isfinite(vectors).all()
+            ):
+                raise ValueError(f"Invalid MiniLM embeddings for {name}")
+            raw = (
+                vectors.to(torch.bfloat16)
+                .cpu()
+                .contiguous()
+                .view(torch.uint16)
+                .numpy()
+                .tobytes()
+            )
+            stream.write(raw)
+            written += len(raw)
+            del vectors
+    if written != len(texts) * 384 * 2:
+        raise ValueError(f"Truncated MiniLM embeddings for {name}")
+
+
 def preprocess(root, suite, split, arm, selection, device, native_bin, model_path):
     if suite == "relbench":
         raw, pre = root / "relbench/raw", forecast_cache(root)
@@ -149,8 +194,18 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
         if suite == "relbench":
             # Train-only statistics are available at both forecast split cutoffs.
             cutoff = min(task["val"][2] for task in policies[name].values())
-            meta.update(forecast_protocol=FORECAST_PROTOCOL, stats_cutoff=cutoff)
+            task_horizons = {
+                table: task["val"][1]
+                for table, task in sorted(policies[name].items())
+            }
+            meta.update(
+                forecast_protocol=FORECAST_PROTOCOL,
+                stats_cutoff=cutoff,
+                task_horizons=task_horizons,
+            )
             native_args = ["--stats-cutoff", str(cutoff)]
+            for table, horizon in task_horizons.items():
+                native_args.extend(["--task-horizon", f"{table}={horizon}"])
         required = (*NATIVE_FILES, f"text_emb_{MINILM}.bin")
         if output.exists():
             if read_json(output / "source.json") != meta or not all(
@@ -186,21 +241,12 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
                     check=True,
                 )
                 texts = read_json(stage / "text.json")
-                vectors = model.encode(
-                    texts, batch_size=256, convert_to_tensor=True
-                ).cpu()
-                if (
-                    vectors.shape != (len(texts), 384)
-                    or not torch.isfinite(vectors).all()
-                ):
-                    raise ValueError(f"Invalid MiniLM embeddings for {name}")
-                path = stage / f"text_emb_{MINILM}.bin"
-                path.write_bytes(
-                    vectors.to(torch.bfloat16)
-                    .contiguous()
-                    .view(torch.uint16)
-                    .numpy()
-                    .tobytes()
+                write_text_embeddings(
+                    model,
+                    texts,
+                    stage / f"text_emb_{MINILM}.bin",
+                    device_type=embedding["device_type"],
+                    name=name,
                 )
                 write_json(stage / "source.json", meta)
                 stage.rename(output)

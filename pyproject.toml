@@ -1,6 +1,9 @@
+# Note: Active RelRel–RT experiments use `.venv` provisioned via `make setup`
+# (`requirements-experiments.txt`, torch==2.8.0). The Pixi table below is kept
+# for upstream `rt-v1` reference compatibility.
 [project]
 name = "rt"
-requires-python = "==3.12"
+requires-python = ">=3.12,<3.13"
 version = "0.1.0"
 
 [build-system]

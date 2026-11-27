@@ -471,8 +471,25 @@ impl Sampler {
             visited.insert(bfs_node_idx);
 
             let node = get_node(dataset, bfs_node_idx);
+            // If this is the seed node, add the focal target cell first so it can
+            // never be truncated when a wide seed row exceeds ctx_len.
+            if node.node_idx == target_node_idx {
+                if let Some(cell_i) = node
+                    .col_name_idxs
+                    .iter()
+                    .position(|&c| i32::from(c) == target_column)
+                {
+                    let col_idx: i32 = node.col_name_idxs[cell_i].into();
+                    if !columns_to_drop.contains(&col_idx) && cells_to_add.len() < self.ctx_len {
+                        cells_to_add.push((bfs_node_idx, cell_i, col_idx));
+                    }
+                }
+            }
             for cell_i in 0..node.col_name_idxs.len() {
                 let col_idx: i32 = node.col_name_idxs[cell_i].into();
+                if node.node_idx == target_node_idx && col_idx == target_column {
+                    continue;
+                }
 
                 // Skip columns to drop
                 if (node.node_idx == target_node_idx && columns_to_drop.contains(&col_idx))
@@ -482,6 +499,9 @@ impl Sampler {
                     continue;
                 }
 
+                if cells_to_add.len() == self.ctx_len {
+                    break;
+                }
                 cells_to_add.push((bfs_node_idx, cell_i, col_idx));
 
                 if cells_to_add.len() == self.ctx_len {
@@ -628,9 +648,9 @@ impl Sampler {
 
             let node = get_node(dataset, node_idx);
 
-            // Update number of cells collected
+            // Update number of cells collected (always retain the seed node)
             num_cells += node.col_name_idxs.len();
-            if num_cells >= max_cells {
+            if num_cells >= max_cells && !result.is_empty() {
                 return result;
             }
 
@@ -655,11 +675,15 @@ impl Sampler {
             // Temporary storage for db edges to be subsampled
             let mut db_p2f_ftr: Vec<i32> = Vec::new();
 
-            // The edges are sorted by timestamp, so we can binary search to find valid ones
+            // The edges are sorted by timestamp, so we can binary search to find valid ones.
+            // Undated non-forecast seeds (e.g. synthetic Entity tables) have no temporal cutoff,
+            // so dated child tables remain reachable via p2f.
             let valid_edges = p2f_edges.as_slice().partition_point(|edge| {
                 edge.timestamp.is_none()
                     || edge.timestamp.as_ref().is_some_and(|time| {
-                        cutoff.or(start_time).is_some_and(|limit| i32::from(*time) <= limit)
+                        cutoff
+                            .or(start_time)
+                            .is_none_or(|limit| i32::from(*time) <= limit)
                     })
             });
 
