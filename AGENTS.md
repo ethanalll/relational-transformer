@@ -4,7 +4,7 @@ PluRel-compatible Relational Transformer (RT) implementation, native Rustler pre
 
 ## Scope & Repository Boundaries
 
-- **This repo owns**: RT preprocessing (`DATA/synthetic/pre/`, `DATA/relbench/pre/forecast-v1/`), RelBench downloads (`DATA/relbench/raw/`), model training/resume, evaluation, and paired contrast summaries (`DATA/runs/`).
+- **This repo owns**: RT preprocessing (`DATA/synthetic/pre/`, `DATA/relbench/pre/forecast-v1/`), RelBench downloads (`DATA/relbench/raw/`), model training/resume, evaluation, and run summaries (`DATA/runs/`).
 - **Synthetic corpus generation** lives in the sibling `../relrel/` repo (`DATA/synthetic/raw/` and `DATA/synthetic/rt/`). Pass the **same absolute `DATA` root** to both repos.
 - **Active vs. legacy entrypoints**: Use `rt/experiment.py`, `rt/experiment_data.py`, and the `Makefile` targets for all RelRel–RT experiments. `rt/main.py`, `rt/embed.py`, and `scripts/example_*.py` are upstream `rt-v1` reference scripts.
 
@@ -15,7 +15,7 @@ PluRel-compatible Relational Transformer (RT) implementation, native Rustler pre
 | `rt/model.py` | PluRel-compatible `RelationalTransformer`, `RelationalBlock`, `MaskedAttention` (per-head Q/K `RMSNorm`, `flex_attention` on CUDA / SDPA on CPU), SwiGLU `FFN`. |
 | `rt/data.py` | `RelationalDataset` wrapper over native `rustler.Sampler`; resolves `column_index.json` / `table_info.json`, reinterprets `bfloat16` arrays, shapes `f2p_nbr_idxs` to `(B, S, 5)`, and attaches RelBench `forecast_policy` rules. |
 | `rt/experiment_data.py` | `python -m rt.experiment_data`: `download` (RelBench datasets/tasks via `RELBENCH_CACHE_DIR`) and `preprocess` (invokes `rustler pre`, encodes `text.json` with `all-MiniLM-L12-v2` into `bfloat16` `.bin`, validates targets/splits, writes `source.json` and manifests). |
-| `rt/experiment.py` | `python -m rt.experiment`: `train` (1-GPU or multi-GPU DDP via `torch.distributed.run`, exact `resume.pt`), `evaluate` (RelBench `amazon`/`all` with `forecast-v1` or `synthetic` holdout), `summarize` (`summary-*.csv`, `contrasts-*.csv`), and `check-model`. |
+| `rt/experiment.py` | `python -m rt.experiment`: `train` (1-GPU or multi-GPU DDP via `torch.distributed.run`, exact `resume.pt`), `evaluate` (RelBench `amazon`/`all` with `forecast-v1` or `synthetic` holdout), `summarize` (`summary-*.csv`), and `check-model`. |
 | `rt/tasks.py` | Canonical RelBench task tuples `(db, table, target_col, leakage_cols)`. `rt/experiment_data.py::REL_BENCH_TASKS` uses the 18 forecasting tasks excluding `rel-event`; `EVAL=amazon` selects the 4 `rel-amazon` tasks. |
 | `rustler/src/common.rs` | Shared `rkyv` structs: `TableInfo`, `TableType` (`Db`, `Train`, `Val`, `Test`), `Edge`, `Adj`, `SemType` (`Number=0`, `Text=1`, `DateTime=2`, `Boolean=3`), `Node`, `Offsets`. |
 | `rustler/src/pre.rs` | Native Parquet preprocessor CLI (`rustler pre`). Applies RelBench schema/type fixups, computes column normalization (optionally filtered by `--stats-cutoff`), and writes `nodes.rkyv`, `offsets.rkyv`, timestamp-sorted `p2f_adj.rkyv`, `text.json`, `text_map.json`, `column_index.json`, `table_info.json`. |
@@ -71,11 +71,9 @@ All RelBench preprocessing, sampling, and scoring follow `FORECAST_PROTOCOL = "f
   - `resume.pt` stores `config` (including `steps`, `source_sha256` of `rt/*.py` + `rustler/Cargo.lock`, `train_corpus_sha256`, git `revision`, hyperparams), `model`, `optimizer`, `scheduler`, `step`, `epoch`, `cursor`, `tokens`, and `slots`.
   - Any mismatch in settings (including `STEPS`, because `OneCycleLR` depends on `total_steps`), code hash, or preprocessed corpus raises `ValueError`. Changing `GPUS` on resume is allowed if `BATCH % GPUS == 0`.
 - **Holdout & summarization (`summarize`)**:
-  - Synthetic holdout evaluation rejects overlapping train/holdout database seeds.
-  - `summarize` requires all arms of a suite to be present per seed and to share `corpus_sha256`, `batch_limit`, sampling settings, and `forecast_protocol`.
-  - Contrasts written to `contrasts-<eval>.csv`:
-    - `factorial` over `(local-original, local-quantile, global-original, global-quantile)`: `global_dag` `(-0.5, -0.5, +0.5, +0.5)`, `quantile` `(-0.5, +0.5, -0.5, +0.5)`, `interaction` `(+1, -1, -1, +1)`.
-    - `sampler` over `(family, direct)`: `direct_minus_family` `(-1, +1)`.
+  - Flat corpus layout: `DATA/synthetic/pre/<CORPUS>/` and `DATA/runs/<RUN>/<CORPUS>/seed-<SEED>/` (no `SUITE`/`ARM`/`SPLIT` indirection).
+  - Synthetic holdout evaluation (`EVAL=synthetic HOLDOUT=<holdout_corpus>`) rejects overlapping train/holdout database seeds.
+  - `summarize` collects all `*/seed-*/eval-<eval>.json` under `DATA/runs/<RUN>/` (optionally filtered by `CORPORA="c1,c2,..."`), verifies matching `corpus_sha256`, `batch_limit`, sampling settings, and `forecast_protocol`, and writes `summary-<eval>.csv`.
 
 ## Setup, Commands & Verification
 
@@ -94,13 +92,14 @@ Set `CARGO_BUILD_JOBS` if Cargo memory/CPU usage must be capped.
 export DATA=/shared/scratch/relrel-rt
 make download-relbench EVAL=amazon
 make preprocess-relbench EVAL=amazon
-make preprocess-synthetic SUITE=factorial
-make preprocess-holdout
+make preprocess-synthetic CORPUS=local-orig
+make preprocess-synthetic CORPUS=global-quant
+make preprocess-synthetic CORPUS=holdout-val
 
-make train SUITE=factorial ARM=global-quantile SEED=0 RUN=pilot GPUS=4 BATCH=128 STEPS=1908
-make evaluate SUITE=factorial ARM=global-quantile SEED=0 RUN=pilot EVAL=amazon
-make evaluate SUITE=factorial ARM=global-quantile SEED=0 RUN=pilot EVAL=synthetic
-make summarize SUITE=factorial RUN=pilot EVAL=amazon
+make train CORPUS=global-quant SEED=0 RUN=pilot GPUS=4 BATCH=128 STEPS=1908
+make evaluate CORPUS=global-quant SEED=0 RUN=pilot EVAL=amazon
+make evaluate CORPUS=global-quant SEED=0 RUN=pilot EVAL=synthetic HOLDOUT=holdout-val
+make summarize RUN=pilot EVAL=amazon CORPORA="local-orig,global-quant"
 ```
 Use `EMBED_DEVICE=cpu` for CPU preprocessing and `MODEL_PATH=/path/to/all-MiniLM-L12-v2` on offline cluster nodes.
 
@@ -115,8 +114,8 @@ Use `EMBED_DEVICE=cpu` for CPU preprocessing and `MODEL_PATH=/path/to/all-MiniLM
    ```
 3. **End-to-end tiny smoke test** (separate `DATA` root; keep CPU smoke runs distinct from cluster runs):
    ```sh
-   make preprocess-arm DATA=/tmp/relrel-smoke SUITE=factorial ARM=global-quantile EMBED_DEVICE=cpu
-   make train DATA=/tmp/relrel-smoke SUITE=factorial ARM=global-quantile SEED=0 RUN=smoke DEVICE=cpu STEPS=10 BATCH=8 CONTEXT=128 CHECKPOINT_EVERY=2
+   make preprocess-synthetic DATA=/tmp/relrel-smoke CORPUS=smoke-global EMBED_DEVICE=cpu
+   make train DATA=/tmp/relrel-smoke CORPUS=smoke-global SEED=0 RUN=smoke DEVICE=cpu STEPS=10 BATCH=8 CONTEXT=128 CHECKPOINT_EVERY=2
    # Re-run with the exact same STEPS and RESUME=1 (interrupt after step >= CHECKPOINT_EVERY to exercise mid-run resume)
-   make train DATA=/tmp/relrel-smoke SUITE=factorial ARM=global-quantile SEED=0 RUN=smoke DEVICE=cpu STEPS=10 BATCH=8 CONTEXT=128 CHECKPOINT_EVERY=2 RESUME=1
+   make train DATA=/tmp/relrel-smoke CORPUS=smoke-global SEED=0 RUN=smoke DEVICE=cpu STEPS=10 BATCH=8 CONTEXT=128 CHECKPOINT_EVERY=2 RESUME=1
    ```

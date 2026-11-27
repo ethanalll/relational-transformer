@@ -142,8 +142,9 @@ def write_text_embeddings(
         raise ValueError(f"Truncated MiniLM embeddings for {name}")
 
 
-def preprocess(root, suite, split, arm, selection, device, native_bin, model_path):
-    if suite == "relbench":
+def preprocess(root, source_kind, corpus, selection, device, native_bin, model_path):
+    is_relbench = source_kind == "relbench"
+    if is_relbench:
         raw, pre = root / "relbench/raw", forecast_cache(root)
         tasks = relbench_tasks(selection)
         names = sorted({task[0] for task in tasks})
@@ -161,8 +162,9 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
         origin = None
         manifest = None
     else:
-        relative = Path(suite) / split / arm
-        raw, pre = root / "synthetic/rt" / relative, root / "synthetic/pre" / relative
+        if Path(corpus).name != corpus or corpus in (".", "..", ""):
+            raise ValueError("CORPUS must be a single directory name")
+        raw, pre = root / "synthetic/rt" / corpus, root / "synthetic/pre" / corpus
         manifest = read_json(raw / "corpus.json")
         tasks = manifest["tasks"]
         names = [entry["id"] for entry in manifest["databases"]]
@@ -191,7 +193,7 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
             "preprocessor_sha256": preprocessor,
         }
         native_args = []
-        if suite == "relbench":
+        if is_relbench:
             # Train-only statistics are available at both forecast split cutoffs.
             cutoff = min(task["val"][2] for task in policies[name].values())
             task_horizons = {
@@ -258,12 +260,12 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
                 raise ValueError(
                     f"Missing target or leakage column: {name}/{table}/{target}"
                 )
-            expected = ("Val", "Test") if suite == "relbench" else ("Db",)
+            expected = ("Val", "Test") if is_relbench else ("Db",)
             if any(f"{table}:{part}" not in tables for part in expected):
                 raise ValueError(f"Missing table or split for {name}/{table}")
         sources[name] = meta
         print(f"Ready {output}", flush=True)
-    ready = f"{selection}.json" if suite == "relbench" else "corpus.json"
+    ready = f"{selection}.json" if is_relbench else "corpus.json"
     write_json(
         pre / ready,
         {
@@ -271,7 +273,8 @@ def preprocess(root, suite, split, arm, selection, device, native_bin, model_pat
             "tasks": tasks,
             "sources": sources,
             "databases": manifest["databases"] if manifest else names,
-            **({"forecast_policies": policies} if suite == "relbench" else {}),
+            **({"hyperparams": manifest.get("hyperparams", {})} if manifest else {}),
+            **({"forecast_policies": policies} if is_relbench else {}),
         },
     )
 
@@ -280,13 +283,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("download", "preprocess"))
     parser.add_argument("--data-root", required=True, type=Path)
-    parser.add_argument(
-        "--suite",
-        choices=("factorial", "sampler", "holdout", "relbench"),
-        default="relbench",
-    )
-    parser.add_argument("--split", choices=("train", "val"), default="train")
-    parser.add_argument("--arm")
+    parser.add_argument("--source", choices=("relbench", "synthetic"), default="relbench")
+    parser.add_argument("--corpus")
     parser.add_argument("--relbench", choices=("amazon", "all"), default="amazon")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -298,13 +296,12 @@ def main():
     if args.command == "download":
         download_relbench(root, args.relbench)
     else:
-        if args.suite != "relbench" and not args.arm:
-            parser.error("Synthetic preprocessing requires --arm")
+        if args.source == "synthetic" and not args.corpus:
+            parser.error("Synthetic preprocessing requires --corpus")
         preprocess(
             root,
-            args.suite,
-            args.split,
-            args.arm,
+            args.source,
+            args.corpus,
             args.relbench,
             args.device,
             args.native_bin,

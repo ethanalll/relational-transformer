@@ -1,4 +1,4 @@
-"""Train, resume, and evaluate the PluRel RT for a specific RelRel ablation arm."""
+"""Train, resume, and evaluate the PluRel RT for a specific RelRel corpus."""
 
 import argparse
 import csv
@@ -27,15 +27,6 @@ from .experiment_data import (
 from .model import RelationalTransformer
 
 DIMS = {"num_blocks": 12, "d_model": 256, "d_text": 384, "num_heads": 8, "d_ff": 1024}
-ARMS = {
-    "factorial": (
-        "local-original",
-        "local-quantile",
-        "global-original",
-        "global-quantile",
-    ),
-    "sampler": ("family", "direct"),
-}
 
 
 def build_model(device):
@@ -97,10 +88,11 @@ def dataset(
     return data
 
 
-def run_dir(root, suite, arm, seed, run):
-    if Path(run).name != run or run in (".", "..", ""):
-        raise ValueError("RUN must be a single directory name")
-    return root / "runs" / run / suite / arm / f"seed-{seed}"
+def run_dir(root, corpus, seed, run):
+    for label, value in (("RUN", run), ("CORPUS", corpus)):
+        if Path(value).name != value or value in (".", "..", ""):
+            raise ValueError(f"{label} must be a single directory name")
+    return root / "runs" / run / corpus / f"seed-{seed}"
 
 
 def save_state(path, payload):
@@ -112,7 +104,7 @@ def save_state(path, payload):
 def train(args, root, out, device, rank, world_size):
     primary = rank == 0
     layout = {"workers": world_size, "batch_per_worker": args.batch // world_size}
-    pre = root / "synthetic/pre" / args.suite / "train" / args.arm
+    pre = root / "synthetic/pre" / args.corpus
     corpus = pre / "corpus.json"
     manifest = read_json(corpus)
     torch.manual_seed(args.seed)
@@ -139,8 +131,7 @@ def train(args, root, out, device, rank, world_size):
     config = {
         key: getattr(args, key)
         for key in (
-            "arm",
-            "suite",
+            "corpus",
             "steps",
             "seed",
             "data_seed",
@@ -390,12 +381,12 @@ def score(model, data, kind, limit, *, forecast=False):
 def evaluate(args, root, out, device):
     forecast = args.eval != "synthetic"
     if not forecast:
-        pre = root / "synthetic/pre/holdout/val/reference"
+        if Path(args.holdout).name != args.holdout or args.holdout in (".", "..", ""):
+            raise ValueError("HOLDOUT must be a single directory name")
+        pre = root / "synthetic/pre" / args.holdout
         corpus, splits = pre / "corpus.json", ("val",)
         if not args.checkpoint:
-            train_manifest = read_json(
-                root / "synthetic/pre" / args.suite / "train" / args.arm / "corpus.json"
-            )
+            train_manifest = read_json(root / "synthetic/pre" / args.corpus / "corpus.json")
             tunable = {item["seed"] for item in train_manifest["databases"]}
             if tunable & {item["seed"] for item in read_json(corpus)["databases"]}:
                 raise ValueError("Training and holdout seeds intersect")
@@ -435,6 +426,7 @@ def evaluate(args, root, out, device):
             "checkpoint_sha256": digest(checkpoint),
             "corpus_sha256": digest(corpus),
             "batch_limit": args.eval_batches,
+            **({"holdout": args.holdout} if not forecast else {}),
             **({"forecast_protocol": FORECAST_PROTOCOL} if forecast else {}),
             "sampling": {
                 key: getattr(args, key) for key in ("batch", "context", "width")
@@ -449,9 +441,17 @@ def evaluation_name(selection):
 
 
 def summarize(root, args):
-    base = root / "runs" / args.run / args.suite
+    base = root / "runs" / args.run
     name = evaluation_name(args.eval)
+    requested = (
+        [item.strip() for item in args.corpora.split(",") if item.strip()]
+        if args.corpora
+        else None
+    )
     paths = sorted(base.glob(f"*/seed-*/eval-{name}.json"))
+    if requested is not None:
+        allowed = set(requested)
+        paths = [path for path in paths if path.parents[1].name in allowed]
     if not paths:
         raise FileNotFoundError(f"No evaluations for {args.eval} under {base}")
     details = {}
@@ -487,21 +487,22 @@ def summarize(root, args):
         }
     if len(protocols) != 1:
         raise ValueError("Evaluations use different corpora or batch limits")
-    seeds = sorted({seed for _, seed in details})
-    missing = [
-        (arm, seed)
-        for seed in seeds
-        for arm in ARMS[args.suite]
-        if (arm, seed) not in details
-    ]
-    if missing:
-        raise ValueError(f"Missing evaluation files for {missing}")
+    if requested is not None:
+        seeds = sorted({seed for _, seed in details})
+        missing = [
+            (corpus, seed)
+            for seed in seeds
+            for corpus in requested
+            if (corpus, seed) not in details
+        ]
+        if missing:
+            raise ValueError(f"Missing evaluation files for {missing}")
     target = base / f"summary-{name}.csv"
     with target.open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(
             [
-                "arm",
+                "corpus",
                 "seed",
                 "split",
                 "metric",
@@ -510,44 +511,9 @@ def summarize(root, args):
                 "scored_tasks",
             ]
         )
-        for (arm, seed), groups in details.items():
+        for (corpus, seed), groups in sorted(details.items()):
             for (split, metric), values in sorted(groups.items()):
-                writer.writerow([arm, seed, split, metric, *values])
-    if args.suite == "factorial":
-        contrasts = {
-            "global_dag": (-0.5, -0.5, 0.5, 0.5),
-            "quantile": (-0.5, 0.5, -0.5, 0.5),
-            "interaction": (1, -1, -1, 1),
-        }
-    else:
-        contrasts = {"direct_minus_family": (-1, 1)}
-    with (base / f"contrasts-{name}.csv").open("w", newline="") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(
-            ["seed", "split", "metric", "contrast", "score_delta", "loss_delta"]
-        )
-        for seed in seeds:
-            groups_by_arm = [details.get((arm, seed), {}) for arm in ARMS[args.suite]]
-            for split, metric in sorted(
-                set.intersection(*(set(g) for g in groups_by_arm))
-            ):
-                pairs = [g[split, metric] for g in groups_by_arm]
-                for label, weights in contrasts.items():
-                    score_delta = (
-                        sum(w * p[0] for w, p in zip(weights, pairs))
-                        if all(p[0] is not None for p in pairs)
-                        else None
-                    )
-                    writer.writerow(
-                        [
-                            seed,
-                            split,
-                            metric,
-                            label,
-                            score_delta,
-                            sum(w * p[1] for w, p in zip(weights, pairs)),
-                        ]
-                    )
+                writer.writerow([corpus, seed, split, metric, *values])
     print(target)
 
 
@@ -559,8 +525,9 @@ def main():
     parser.add_argument(
         "--data-root", type=Path, default=Path.home() / "scratch/relrel-rt"
     )
-    parser.add_argument("--suite", choices=ARMS, default="factorial")
-    parser.add_argument("--arm", default="global-quantile")
+    parser.add_argument("--corpus", default="global-quantile")
+    parser.add_argument("--holdout", default="holdout-val")
+    parser.add_argument("--corpora", default="")
     parser.add_argument("--run", default="pilot")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-seed", type=int, default=0)
@@ -604,9 +571,7 @@ def main():
             + ("; strict checkpoint loaded" if args.checkpoint else "")
         )
         return
-    if args.arm not in ARMS[args.suite]:
-        parser.error(f"Expected one of {', '.join(ARMS[args.suite])} for {args.suite}")
-    out = run_dir(root, args.suite, args.arm, args.seed, args.run)
+    out = run_dir(root, args.corpus, args.seed, args.run)
     if args.command == "train":
         if args.steps < 6:
             parser.error("Use at least six steps with the paper's warmup schedule")
